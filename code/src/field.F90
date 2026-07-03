@@ -2270,7 +2270,7 @@ contains
       offset_z = offset_y + size_real*self%grid%nymax + storage_size(gridsize_64)/8
       delta_offset_w = gridsize_64 + storage_size(gridsize_64)/8 ! the second part is because of the header of bytes before data
 
-      open(unit=123, file=trim(file_prefix_)//chstore//'.vtr', access="stream", form="unformatted", status="replace")
+      open(unit=123, file="FIELDS/"//trim(file_prefix_)//chstore//'.vtr', access="stream", form="unformatted", status="replace")
       xml_part = ' <?xml version="1.0"?> <VTKFile type="RectilinearGrid" version="1.0" byte_order="L&
       &ittleEndian" header_type="UInt64"> <RectilinearGrid WholeExtent="+1 +' //int2str(self%grid%nxmax)//&
       &' +1 +'//int2str(self%grid%nymax)//' +1 +'//int2str(self%grid%nzmax)//'"> <Piece Extent="+1 +'//&
@@ -2317,13 +2317,13 @@ contains
     do l=1,nv_io
       call MPI_BARRIER(self%mp_cart,self%mpi_err)
       if (self%masterproc) then
-        open(unit=123, file=trim(file_prefix_)//chstore//'.vtr', access="stream", form="unformatted", position="append")
+        open(unit=123, file="FIELDS/"//trim(file_prefix_)//chstore//'.vtr', access="stream", form="unformatted", position="append")
         write(123) gridsize_64
         flush(123)
         close(123)
       endif
       call MPI_BARRIER(self%mp_cart, self%mpi_err)
-      call MPI_FILE_OPEN(self%mp_cart,trim(file_prefix_)//chstore//'.vtr',MPI_MODE_RDWR,MPI_INFO_NULL,mpi_io_file,self%mpi_err)
+      call MPI_FILE_OPEN(self%mp_cart,"FIELDS/"//trim(file_prefix_)//chstore//'.vtr',MPI_MODE_RDWR,MPI_INFO_NULL,mpi_io_file,self%mpi_err)
       call MPI_FILE_GET_SIZE(mpi_io_file, offset, self%mpi_err)
       call MPI_BARRIER(self%mp_cart, self%mpi_err)
       call MPI_FILE_SET_VIEW(mpi_io_file,offset,mpi_prec,filetype,"native",MPI_INFO_NULL,self%mpi_err)
@@ -2333,7 +2333,7 @@ contains
 
     call MPI_TYPE_FREE(filetype,self%mpi_err)
     if (self%masterproc) then
-      open(unit=123, file=trim(file_prefix_)//chstore//'.vtr', access="stream", position="append", form="unformatted")
+      open(unit=123, file="FIELDS/"//trim(file_prefix_)//chstore//'.vtr', access="stream", position="append", form="unformatted")
       write(123) ' </AppendedData> </VTKFile>'
       close(123)
     endif
