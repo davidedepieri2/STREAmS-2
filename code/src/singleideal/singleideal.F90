@@ -679,6 +679,7 @@ contains
     call self%field%compute_local_grid_metrics(self%coeff_deriv1, self%ep_ord_change, self%lmax_tag)
 
     call self%cfg%get("numerics","rk_type",self%rk_type)
+    if(self%rk_type /= RK_WRAY) call fail_input_any("only rk_type=1 is currently implemented")
     call self%runge_kutta_initialize()
     call self%cfg%get("controls","cfl",self%cfl)
     call self%cfg%get("controls","num_iter",self%num_iter)
@@ -2219,10 +2220,10 @@ contains
             costh = dxdcsic2(i,1)/ds
             sinth = dydcsic2(i,1)/ds
 
-            ut1 = (w_stat_z(2,i,1)*costh+w_stat_z(3,i,1)*sinth)/w_stat_z(1,i,1)
-            ut2 = (w_stat_z(2,i,2)*costh+w_stat_z(3,i,2)*sinth)/w_stat_z(1,i,2)
-            ut3 = (w_stat_z(2,i,3)*costh+w_stat_z(3,i,3)*sinth)/w_stat_z(1,i,3)
-            ut4 = (w_stat_z(2,i,4)*costh+w_stat_z(3,i,4)*sinth)/w_stat_z(1,i,4)
+            ut1 = (w_stat_z(2,i,1)*costh+w_stat_z(3,i,1)*sinth)
+            ut2 = (w_stat_z(2,i,2)*costh+w_stat_z(3,i,2)*sinth)
+            ut3 = (w_stat_z(2,i,3)*costh+w_stat_z(3,i,3)*sinth)
+            ut4 = (w_stat_z(2,i,4)*costh+w_stat_z(3,i,4)*sinth)
             dudy = -22._rkind*ut1+36._rkind*ut2-18._rkind*ut3+4._rkind*ut4
             dudyw = dudy*meta(i,1)/12._rkind
             tauw = w_stat_z(20,i,1)*dudyw
@@ -3150,7 +3151,7 @@ contains
       enddo
       res = 0._rkind
       do j=1,ny+1
-        res = abs(yplus(j)-yplusold(j))
+        res = res + abs(yplus(j)-yplusold(j))
       enddo
       res = res/(ny+1)
       if (res<tol_iter) exit
