@@ -115,6 +115,7 @@ module streams_equation_singleideal_gpu_object
     procedure, pass(self) :: euler_z
     procedure, pass(self) :: visflx
     procedure, pass(self) :: compute_aux
+    procedure, pass(self) :: compute_aux_les
     procedure, pass(self) :: recyc_exchange
     procedure, pass(self) :: bcrecyc
     procedure, pass(self) :: bc_nr
@@ -254,11 +255,14 @@ contains
         endif
       elseif (mode == 5) then
         call visflx_x_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
-        & calorically_perfect, self%base_gpu%x_gpu, w_aux_gpu, self%fl_gpu, self%fhat_gpu)
+        & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
+        & self%base_gpu%x_gpu, w_aux_gpu, self%fl_gpu, self%fhat_gpu)
         call visflx_y_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
-        & calorically_perfect, self%base_gpu%y_gpu, self%w_aux_gpu, self%fl_gpu)
+        & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
+        & self%base_gpu%y_gpu, self%w_aux_gpu, self%fl_gpu)
         call visflx_z_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
-        & calorically_perfect, self%base_gpu%z_gpu, self%w_aux_gpu, self%fl_gpu)
+        & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
+        & self%base_gpu%z_gpu, self%w_aux_gpu, self%fl_gpu)
       elseif (mode == 6) then
         call visflx_reduced_ord2_cuf(nx, ny, nz, ng, prandtl, t0, indx_cp_l, indx_cp_r,&
         & cp_coeff_gpu, calorically_perfect, u0, l0, self%base_gpu%w_gpu, self%w_aux_gpu, self%fl_gpu, x_gpu,&
@@ -319,6 +323,73 @@ contains
     endassociate
   endsubroutine compute_aux
 
+  subroutine compute_aux_les(self)
+      class(equation_singleideal_gpu_object), intent(inout) :: self
+      associate(nx => self%nx, ny => self%ny, nz => self%nz, ng => self%ng, &
+                ep_order => self%equation_base%ep_order, &
+                les_model => self%equation_base%les_model, &
+                w_gpu => self%base_gpu%w_gpu, &
+                w_aux_gpu => self%w_aux_gpu, &
+                coeff_deriv1_gpu => self%coeff_deriv1_gpu, &
+                dcsidx_gpu => self%base_gpu%dcsidx_gpu,   &
+                detady_gpu => self%base_gpu%detady_gpu,   &
+                dzitdz_gpu => self%base_gpu%dzitdz_gpu,   &
+                cv_coeff_gpu => self%cv_coeff_gpu, &
+                cp_coeff_gpu => self%cp_coeff_gpu, &
+                indx_cp_l => self%equation_base%indx_cp_l, &
+                indx_cp_r => self%equation_base%indx_cp_r, &
+                calorically_perfect => self%equation_base%calorically_perfect, &
+                t0 => self%equation_base%t0, u0 => self%equation_base%u0, l0 => self%equation_base%l0, &
+                les_c_wale => self%equation_base%les_c_wale, &
+                les_pr => self%equation_base%les_pr, &
+                les_c_yoshi => self%equation_base%les_c_yoshi, &
+                visc_model => self%visc_model, mu0 => self%mu0, &
+                T_ref_dim => self%T_ref_dim, &
+                sutherland_S => self%sutherland_S, &
+                powerlaw_vtexp => self%powerlaw_vtexp, &
+                Prandtl => self%equation_base%Prandtl, &
+                grid_dim => self%grid%grid_dim, &
+                rgas0 => self%equation_base%rgas0, &
+                visc_order => self%equation_base%visc_order, &
+                wall_tag_gpu => self%base_gpu%wall_tag_gpu, &
+                vis_tag_gpu  => self%vis_tag_gpu, &
+                jac_gpu      => self%base_gpu%jac_gpu, &
+                dcsidxc2_gpu => self%base_gpu%dcsidxc2_gpu, &
+                detadyc2_gpu => self%base_gpu%detadyc2_gpu, &
+                detadxc2_gpu => self%base_gpu%detadxc2_gpu, &
+                dcsidyc2_gpu => self%base_gpu%dcsidyc2_gpu)
+
+
+      call eval_velaux_cuf(nx,ny,nz,ng,w_gpu,w_aux_gpu) ! aux 1,2,3,4
+
+      select case (les_model)
+       case(1)
+        if (grid_dim == 1) then
+         call les_wale_mut_cuf(nx,ny,nz,ng,ep_order,w_aux_gpu,coeff_deriv1_gpu, &
+              dcsidx_gpu,detady_gpu,dzitdz_gpu,les_c_wale,les_c_yoshi,u0,l0) ! 9,10,11,12
+        elseif (grid_dim == 2) then
+        call les_wale_mut_c2_cuf(nx,ny,nz,ng,visc_order,w_aux_gpu,coeff_deriv1_gpu, dzitdz_gpu, &
+              dcsidxc2_gpu, detadxc2_gpu, dcsidyc2_gpu, detadyc2_gpu, &
+              wall_tag_gpu,vis_tag_gpu,jac_gpu,les_c_wale,les_c_yoshi,u0,l0) ! 9,10,11,12
+        endif
+      end select
+
+      call self%base_gpu%bcswap_var(self%w_aux_gpu(:,:,:,9:9))   ! Swap sensor
+      call self%bcextr_var(self%w_aux_gpu(:,:,:,10:10), mode=1)
+      call self%base_gpu%bcswap_var(self%w_aux_gpu(:,:,:,10:10))
+      call self%bcextr_var(self%w_aux_gpu(:,:,:,11:11), mode=1)
+      call self%base_gpu%bcswap_var(self%w_aux_gpu(:,:,:,11:11))
+      call self%bcextr_var(self%w_aux_gpu(:,:,:,12:12), mode=1)
+      call self%base_gpu%bcswap_var(self%w_aux_gpu(:,:,:,12:12))
+
+      call eval_aux_les_cuf(nx, ny, nz, ng, self%base_gpu%w_gpu, self%w_aux_gpu, &
+           visc_model, mu0, t0, sutherland_S, T_ref_dim, &
+           powerlaw_vtexp, VISC_POWER, VISC_SUTHERLAND, VISC_NO, Prandtl, cp_coeff_gpu, cv_coeff_gpu,  &
+           indx_cp_l, indx_cp_r, rgas0, calorically_perfect, tol_iter_nr,les_pr)
+
+      endassociate
+  endsubroutine compute_aux_les
+
   subroutine rk_sync(self)
     class(equation_singleideal_gpu_object), intent(inout) :: self
     integer :: istep, lmax, iercuda
@@ -346,7 +417,11 @@ contains
 
         call init_flux_cuf(nx, ny, nz, nv, self%fl_gpu, self%fln_gpu, rhodt)
         call self%base_gpu%bcswap()
-        call self%compute_aux()
+        if (self%equation_base%enable_les>0) then
+         call self%compute_aux_les()
+        else
+         call self%compute_aux()
+        endif
         !@cuf iercuda=cudadevicesynchronize()
         call self%euler_x(eul_imin, eul_imax)
         !@cuf iercuda=cudadevicesynchronize()
@@ -1537,7 +1612,11 @@ contains
     &ion_base%time_is_freezed)
 
       call self%update_ghost()
-      call self%compute_aux()
+      if (self%equation_base%enable_les>0) then
+       call self%compute_aux_les()
+      else
+       call self%compute_aux()
+      endif
       !@cuf iercuda=cudadevicesynchronize()
 
       if (mode_async >= 0) then
@@ -1598,7 +1677,11 @@ contains
         else
           icyc = icyc + 1
           if(self%equation_base%cfl > 0 .and. mod(icyc-icyc0, iter_dt_recompute)==0) then
-            call self%compute_aux(central=1, ghost=0)
+            if (self%equation_base%enable_les>0) then
+             call self%compute_aux_les()
+            else
+             call self%compute_aux(central=1, ghost=0)
+            endif
             !@cuf iercuda=cudadevicesynchronize()
             call self%compute_dt()
           endif
@@ -1736,7 +1819,11 @@ contains
     & powerlaw_vtexp => self%powerlaw_vtexp, w_aux_gpu => self%w_aux_gpu, cv_coeff_gpu => self%cv_coeff_g&
     &pu, indx_cp_l => self%equation_base%indx_cp_l, indx_cp_r => self%equation_base%indx_cp_r,&
     & calorically_perfect => self%equation_base%calorically_perfect)
-      call self%compute_aux()
+      if (self%equation_base%enable_les>0) then
+       call self%compute_aux_les()
+      else
+       call self%compute_aux()
+      endif
     endassociate
     if (self%equation_base%npsi > 0) then
       call self%insitu_compute_psi()

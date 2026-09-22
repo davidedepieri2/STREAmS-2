@@ -63,6 +63,11 @@ module streams_equation_singleideal_object
 
     integer(ikind) :: visc_order, conservative_viscous
     integer(ikind) :: ep_order, nkeep
+
+!   LES (WALE subgrid-scale model, no wall model / no IBM)
+    integer(ikind) :: enable_les = 0
+    integer(ikind) :: les_model
+    real(rkind) :: les_c_wale, les_pr, les_c_yoshi
     integer(ikind) :: weno_scheme, weno_version, flux_splitting
     real(rkind) :: sensor_threshold
     real(rkind) :: xshock_imp, shock_angle, tanhfacs
@@ -470,6 +475,10 @@ contains
 
     self%nv = 5
     self%nv_aux = 10
+    if (self%cfg%has_key("lespar","enable_les")) then
+     call self%cfg%get("lespar","enable_les",self%enable_les)
+    endif
+    if (self%enable_les>0) self%nv_aux = self%nv_aux+2
     if(self%grid%grid_dim == 1) then
       self%nv_stat = 70
     elseif(self%grid%grid_dim == 2) then
@@ -861,6 +870,24 @@ contains
 
 
     if (self%enable_insitu>0) call self%insitu_initialize()
+
+!   LES model (WALE), no wall model / no IBM
+    if (self%enable_les>0) then
+     call self%cfg%get("lespar","les_model",self%les_model)
+     call self%cfg%get("lespar","les_pr",self%les_pr)
+     call self%cfg%get("lespar","les_c_yoshi",self%les_c_yoshi)
+     select case (self%les_model)
+     case(1)
+      if (self%masterproc) write(*,*) 'LES model: WALE'
+      call self%cfg%get("lespar","les_c_wale",self%les_c_wale)
+     case default
+      call fail_input_any("LES model not implemented")
+     end select
+     if (self%mode_async/=0) then
+      if (self%masterproc) write(*,*) 'Changing mode async to 0 for LES'
+      self%mode_async = 0
+     endif
+    endif
 
   endsubroutine initialize
 

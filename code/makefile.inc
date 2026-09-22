@@ -1,0 +1,21 @@
+#----------------------------------------------------------------------
+# SUPPORTED COMPILE: nv-cuda, nv, intel, gnu, ibmxl, cray-cuda
+# SUPPORTED MODES  : opt, debug [default=debug]
+# SUPPORTED PRECISIONS (PREC) : single, double [default=double]
+#----------------------------------------------------------------------
+EQUATION = "singleideal"
+BACKEND  = "gpu"
+COMPILE  = "nv-cuda"
+MODE     = "opt"
+PREC     = "double"
+CUDA_VER = ""
+MPI_CMD  = 
+CGAL     = "no"
+CATALYST = "no"
+
+define LOAD
+module load profile/global ;
+module load nvhpc/24.5 ;
+module load hpcx-mpi/2.19 ;
+endef
+export LOAD
