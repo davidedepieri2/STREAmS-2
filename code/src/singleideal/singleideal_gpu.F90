@@ -80,6 +80,7 @@ module streams_equation_singleideal_gpu_object
     real(rkind), dimension(:,:,:,:), allocatable, device :: probe_coeff_gpu
     integer, dimension(:,:), allocatable, device :: ijk_probe_gpu
     real(rkind), allocatable, dimension(:,:,:), device :: wallprop_gpu
+    real(rkind), allocatable, dimension(:,:), device :: tauw_wm_gpu, qwall_wm_gpu
 
     integer, dimension(:), allocatable, device :: lmax_tag_gpu
     integer, dimension(:), allocatable, device :: vis_tag_gpu
@@ -116,6 +117,7 @@ module streams_equation_singleideal_gpu_object
     procedure, pass(self) :: visflx
     procedure, pass(self) :: compute_aux
     procedure, pass(self) :: compute_aux_les
+    procedure, pass(self) :: eval_wmles_wall
     procedure, pass(self) :: recyc_exchange
     procedure, pass(self) :: bcrecyc
     procedure, pass(self) :: bc_nr
@@ -205,7 +207,7 @@ contains
     & itu_rank_x => self%field%itu_rank_x, ite_l => self%field%ite_l, itu_l => self%field%itu_l,&
     & teshk => self%equation_base%teshk, ortho => self%equation_base%ortho, jweno => self%equation_base%j&
     &weno, theta_ij_gpu => self%base_gpu%theta_ij_gpu, theta_threshold => self%equation_base%theta_thresh&
-    &old)
+    &old, enable_wmles => self%equation_base%enable_wmles)
 
       if (mode == 0) then
         if (grid_dim == 1) then
@@ -259,7 +261,8 @@ contains
         & self%base_gpu%x_gpu, w_aux_gpu, self%fl_gpu, self%fhat_gpu)
         call visflx_y_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
         & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
-        & self%base_gpu%y_gpu, self%w_aux_gpu, self%fl_gpu)
+        & self%base_gpu%y_gpu, self%w_aux_gpu, self%fl_gpu, &
+        & enable_wmles, self%tauw_wm_gpu, self%qwall_wm_gpu)
         call visflx_z_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
         & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
         & self%base_gpu%z_gpu, self%w_aux_gpu, self%fl_gpu)
@@ -390,6 +393,34 @@ contains
       endassociate
   endsubroutine compute_aux_les
 
+  subroutine eval_wmles_wall(self)
+      class(equation_singleideal_gpu_object), intent(inout) :: self
+      type(dim3) :: gridDim, blockDim
+      associate(nx => self%nx, nz => self%nz, ng => self%ng, &
+                jmatch => self%equation_base%jmatch, &
+                wmles_model => self%equation_base%wmles_model, &
+                twall => self%equation_base%T_wall, &
+                Prandtl => self%equation_base%Prandtl, &
+                mu0 => self%mu0, t0 => self%equation_base%t0, &
+                T_ref_dim => self%T_ref_dim, sutherland_S => self%sutherland_S, &
+                rgas0 => self%equation_base%rgas0, u0 => self%equation_base%u0, &
+                cp_coeff_gpu => self%cp_coeff_gpu, &
+                indx_cp_l => self%equation_base%indx_cp_l, &
+                indx_cp_r => self%equation_base%indx_cp_r, &
+                calorically_perfect => self%equation_base%calorically_perfect, &
+                y_gpu => self%base_gpu%y_gpu, w_aux_gpu => self%w_aux_gpu, &
+                tauw_wm_gpu => self%tauw_wm_gpu, qwall_wm_gpu => self%qwall_wm_gpu)
+
+      blockDim = dim3(16,16,1)
+      gridDim = dim3(ceiling(real(nx)/blockDim%x),ceiling(real(nz)/blockDim%y),1)
+      call eval_wmles_wall_cuf<<<gridDim, blockDim>>>(nx, nz, ng, jmatch, wmles_model, twall, &
+           Prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
+           cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
+           y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu)
+
+      endassociate
+  endsubroutine eval_wmles_wall
+
   subroutine rk_sync(self)
     class(equation_singleideal_gpu_object), intent(inout) :: self
     integer :: istep, lmax, iercuda
@@ -422,6 +453,7 @@ contains
         else
          call self%compute_aux()
         endif
+        if (self%equation_base%enable_wmles>0) call self%eval_wmles_wall()
         !@cuf iercuda=cudadevicesynchronize()
         call self%euler_x(eul_imin, eul_imax)
         !@cuf iercuda=cudadevicesynchronize()
@@ -1364,6 +1396,8 @@ contains
       allocate(self%fl_gpu(1:nx, 1:ny, 1:nz, nv))
       allocate(self%fln_gpu(1:nx, 1:ny, 1:nz, nv))
       allocate(self%wallprop_gpu(1-ng:nx+ng, 1-ng:nz+ng, 2:4))
+      allocate(self%tauw_wm_gpu(1:nx, 1:nz))
+      allocate(self%qwall_wm_gpu(1:nx, 1:nz))
       allocate(self%fhat_gpu(1-ng:nx+ng, 1-ng:ny+ng, 1-ng:nz+ng, nv))
 
       allocate(self%wrecyc_gpu(ng,ny,nz,nv))

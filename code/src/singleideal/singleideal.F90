@@ -68,6 +68,11 @@ module streams_equation_singleideal_object
     integer(ikind) :: enable_les = 0
     integer(ikind) :: les_model
     real(rkind) :: les_c_wale, les_pr, les_c_yoshi
+
+!   WMLES (equilibrium wall model, flat wall, no IBM, no roughness)
+    integer(ikind) :: enable_wmles = 0
+    integer(ikind) :: wmles_model
+    integer(ikind) :: jmatch
     integer(ikind) :: weno_scheme, weno_version, flux_splitting
     real(rkind) :: sensor_threshold
     real(rkind) :: xshock_imp, shock_angle, tanhfacs
@@ -887,6 +892,22 @@ contains
       if (self%masterproc) write(*,*) 'Changing mode async to 0 for LES'
       self%mode_async = 0
      endif
+    endif
+
+!   WMLES (equilibrium wall model), flat wall, no IBM, no roughness
+    if (self%cfg%has_key("wmlespar","enable_wmles")) then
+     call self%cfg%get("wmlespar","enable_wmles",self%enable_wmles)
+    endif
+    if (self%enable_wmles>0) then
+     call self%cfg%get("wmlespar","wmles_model",self%wmles_model)
+     call self%cfg%get("wmlespar","jmatch",self%jmatch)
+     select case (self%wmles_model)
+     case(1)
+      if (self%masterproc) write(*,*) 'WMLES model: EWM'
+     case default
+      call fail_input_any("WMLES model not implemented")
+     end select
+     if (self%masterproc) write(*,*) 'WMLES matching node jmatch =', self%jmatch
     endif
 
   endsubroutine initialize

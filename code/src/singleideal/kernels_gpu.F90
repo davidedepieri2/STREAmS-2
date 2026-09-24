@@ -5019,15 +5019,18 @@ contains
   endsubroutine visflx_x_cuf
 
   subroutine visflx_y_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
-  & calorically_perfect, enable_les, les_pr, y_gpu, w_aux_gpu, fl_gpu)
+  & calorically_perfect, enable_les, les_pr, y_gpu, w_aux_gpu, fl_gpu, &
+  & enable_wmles, tauw_wm_gpu, qwall_wm_gpu)
 
     integer, intent(in) :: nx, ny, nz, nv, ng, calorically_perfect, enable_les
     integer, intent(in) :: indx_cp_l, indx_cp_r
     real(rkind), intent(in) :: prandtl, t0, les_pr
+    integer, intent(in) :: enable_wmles
     real(rkind), dimension(1:nx,1:ny,1:nz,1:nv), intent(inout), device :: fl_gpu
     real(rkind), dimension(1-ng:,1-ng:,1-ng:,1:), intent(in), device :: w_aux_gpu
     real(rkind), dimension(1-ng:), intent(in), device :: y_gpu
     real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in), device :: cp_coeff_gpu
+    real(rkind), dimension(1:,1:), intent(in), device :: tauw_wm_gpu, qwall_wm_gpu
     integer :: i,j,k,iv,ll,iercuda
     real(rkind) :: uu,vv,ww,tt,mu,qq
     real(rkind) :: uup,vvp,wwp,ttp,mup,qqp
@@ -5075,6 +5078,13 @@ contains
             sigq = ((muf-mu_sgsf)*cploc/prandtl+mu_sgsf*cploc/les_pr)*sigq_tt + sigq_qq*muf
           else
             sigq = (sigq_tt*cploc/prandtl+sigq_qq)*muf
+          endif
+          if (j==0 .and. enable_wmles>0) then
+            ! Equilibrium wall model: replace the molecular-gradient wall-face flux
+            ! (which assumes a resolved viscous sublayer) with the modeled tau_wall/q_wall,
+            ! precomputed by eval_wmles_wall_cuf (matched to the resolved state at jmatch).
+            sigx = tauw_wm_gpu(i,k)
+            sigq = qwall_wm_gpu(i,k) + tauw_wm_gpu(i,k)*uup
           endif
           if (j>0) then
             fl_gpu(i,j,k,2) = fl_gpu(i,j,k,2) + fl2o-sigx*dyhl
@@ -8495,6 +8505,171 @@ contains
          enddo
         enddo
     endsubroutine eval_aux_les_cuf
+
+!
+!   WMLES (equilibrium wall model)
+!
+    attributes(device) subroutine odewmles_ref(Prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+                      calorically_perfect,sutherland_S,u_inf,hw,u_p,T_w,T_h,p_h,tau_wall,q_wall)
+    ! Equilibrium wall model: integrates a mixing-length (Van Driest damped) ODE
+    ! for u(y) and T(y) between the wall (y=0) and the matching point (y=hw),
+    ! iterating on tau_wall until the integrated u(hw) matches the resolved u_p.
+    implicit none
+
+    integer, parameter :: Ny = 1000
+    integer, parameter :: max_iter = 150
+    real(rkind), parameter :: kappa = 0.41_rkind
+    real(rkind), parameter :: A_plus = 17._rkind
+    real(rkind), parameter :: Pr_t = 0.9_rkind
+    real(rkind), parameter :: relax = 0.3_rkind
+    real(rkind), parameter :: tol = 1.0e-6_rkind
+
+    integer, value :: calorically_perfect, indx_cp_l, indx_cp_r
+    real(rkind), value :: Prandtl, mu0, t0, u_inf, rgas0
+    real(rkind), value :: T_ref_dim, sutherland_S
+    real(rkind), value :: hw, u_p, T_h, p_h, T_w
+    real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in) :: cp_coeff_gpu
+    real(rkind), intent(out) :: tau_wall, q_wall
+
+    real(rkind) :: qw
+    real(rkind) :: rhow, muw, utau, l_visc, dy, mu_lam, mu_prime
+    real(rkind) :: int1, int2, int3, int4, mu_t, y_half, yp
+    real(rkind) :: mu_tot, k_lam, k_t, k_tot, unew, tnew
+    real(rkind) :: J, dtau, dhstar, rho, s_Pr, tau_w
+    real(rkind) :: cploc
+    real(rkind), dimension(1:Ny) :: y_sol1, u_sol1, T_sol1, ddy
+    integer :: iter, iter_sec, ll
+
+    if (calorically_perfect==1) then
+     cploc = cp_coeff_gpu(0)
+    else
+     cploc = 0._rkind
+     do ll=indx_cp_l,indx_cp_r
+      cploc = cploc+cp_coeff_gpu(ll)*(T_w/t0)**ll
+     enddo
+    endif
+
+    muw  = mu0 * (T_w/t0)**1.5_rkind * &
+           (1._rkind + sutherland_S/T_ref_dim)/(T_w/t0 + sutherland_S/T_ref_dim)
+    rhow = p_h/T_w/rgas0
+
+    tau_w = muw*u_p/max(hw, tiny(1._rkind))
+    qw    = muw*cploc/Prandtl*(T_h - T_w)/max(hw, tiny(1._rkind))
+
+    s_Pr  = 1.14_rkind*Prandtl
+
+    do iter = 1, max_iter
+      utau   = sqrt(tau_w/rhow)
+      l_visc = muw/(rhow*utau)
+
+      int1 = 0._rkind
+      int2 = 0._rkind
+      int3 = 0._rkind
+      int4 = 0._rkind
+
+      y_sol1(1) = 0._rkind
+      u_sol1(1) = 0._rkind
+      T_sol1(1) = T_w
+
+      dy = 0.5_rkind*l_visc
+      iter_sec = 1
+
+      do while (y_sol1(iter_sec) < hw)
+       dy = min(dy, hw - y_sol1(iter_sec))
+       ddy(iter_sec) = dy
+       y_half = y_sol1(iter_sec) + 0.5_rkind*dy
+
+       yp  = y_half*sqrt(rhow*tau_w)/max(muw, tiny(1._rkind))
+       rho = p_h/max(T_sol1(iter_sec), tiny(1._rkind))/rgas0
+
+       mu_t = kappa*rho*sqrt(tau_w/rho)*y_half*(1._rkind-exp(-yp/A_plus))**2
+       mu_lam = mu0 * (T_sol1(iter_sec)/t0)**1.5_rkind * &
+                (1._rkind + sutherland_S/T_ref_dim)/(T_sol1(iter_sec)/t0 + sutherland_S/T_ref_dim)
+
+       if (calorically_perfect==1) then
+        cploc = cp_coeff_gpu(0)
+       else
+        cploc = 0._rkind
+        do ll=indx_cp_l,indx_cp_r
+         cploc = cploc+cp_coeff_gpu(ll)*(T_sol1(iter_sec)/t0)**ll
+        enddo
+       endif
+
+       mu_tot = mu_lam + mu_t
+       k_lam  = cploc*mu_lam/Prandtl
+       k_t    = cploc*mu_t/Pr_t
+       k_tot  = k_lam + k_t
+
+       unew = u_sol1(iter_sec) + dy*tau_w/max(mu_tot, tiny(1._rkind))
+       tnew = T_sol1(iter_sec) + dy/max(k_tot, tiny(1._rkind)) * &
+               (qw - 0.5_rkind*tau_w*u_sol1(iter_sec) - 0.5_rkind*tau_w*unew)
+
+       mu_prime = Pr_t*mu_lam/Prandtl
+       int1 = int1 + dy/max((mu_prime + mu_t), tiny(1._rkind))
+       int2 = int2 + 0.5_rkind*(u_sol1(iter_sec) + unew)*dy/max((mu_prime + mu_t), tiny(1._rkind))
+       int3 = int3 + dy/max((mu_lam + mu_t), tiny(1._rkind))
+       int4 = int4 + 0.5_rkind*mu_t*dy/max((mu_tot*mu_tot), tiny(1._rkind))/max(sqrt(tau_w), tiny(1._rkind))
+
+       y_sol1(iter_sec+1) = y_sol1(iter_sec) + dy
+       u_sol1(iter_sec+1) = unew
+       T_sol1(iter_sec+1) = tnew
+       iter_sec = iter_sec + 1
+       if (iter_sec >= Ny) exit
+      end do
+
+      J    = int3 - sqrt(tau_w)*int4
+      dtau = (u_p - u_sol1(iter_sec))/max(J, tiny(1._rkind))
+      tau_w = tau_w + relax*dtau
+
+      dhstar = cploc*(T_h - T_w)
+      qw = relax*((dhstar/Pr_t + tau_w*int2)/max(int1, tiny(1._rkind))) + (1._rkind-relax)*qw
+
+      if (abs(u_sol1(iter_sec) - u_p)/max(abs(u_p), tiny(1._rkind)) < tol) exit
+    end do
+
+    tau_wall = tau_w
+    q_wall   = qw
+
+    endsubroutine odewmles_ref
+
+    attributes(global) subroutine eval_wmles_wall_cuf(nx, nz, ng, jmatch, wmles_model, twall, &
+                      prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
+                      cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
+                      y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu)
+    ! Precomputes the wall-modeled tau_wall/q_wall for every (i,k) wall-parallel
+    ! column, once per RK substep, ahead of visflx_y_cuf (which just reads the result
+    ! at the wall face). Kept as a separate global kernel because NVFORTRAN does not
+    ! support calling an intent(out)-argument device subroutine from within a
+    ! !$cuf kernel do loop (visflx_y_cuf uses that construct).
+    implicit none
+    integer, value :: nx, nz, ng, jmatch, wmles_model, indx_cp_l, indx_cp_r, calorically_perfect
+    real(rkind), value :: twall, prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0
+    real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in) :: cp_coeff_gpu
+    real(rkind), dimension(1-ng:), intent(in) :: y_gpu
+    real(rkind), dimension(1-ng:,1-ng:,1-ng:,1:), intent(in) :: w_aux_gpu
+    real(rkind), dimension(1:,1:), intent(out) :: tauw_wm_gpu, qwall_wm_gpu
+    integer :: i, k
+    real(rkind) :: dist_wm, u_hwm, t_hwm, p_hwm, tau_wall_wm, q_wall_wm
+
+    i = blockDim%x * (blockIdx%x - 1) + threadIdx%x
+    k = blockDim%y * (blockIdx%y - 1) + threadIdx%y
+    if (i > nx .or. k > nz) return
+
+    dist_wm = y_gpu(jmatch)
+    u_hwm = w_aux_gpu(i,jmatch,k,2)
+    t_hwm = w_aux_gpu(i,jmatch,k,6)
+    p_hwm = w_aux_gpu(i,jmatch,k,1)*t_hwm*rgas0
+
+    select case (wmles_model)
+    case(1)
+      call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+           calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
+    end select
+
+    tauw_wm_gpu(i,k) = tau_wall_wm
+    qwall_wm_gpu(i,k) = q_wall_wm
+
+    endsubroutine eval_wmles_wall_cuf
 
 endmodule streams_kernels_gpu
 
