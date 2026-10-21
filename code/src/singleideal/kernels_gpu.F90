@@ -5093,7 +5093,18 @@ contains
             fl_gpu(i,j,k,5) = fl_gpu(i,j,k,5) + fl5o-sigq*dyhl
           endif
           if (j<ny) then
-            dyhl = 2._rkind/(y_gpu(j+2)-y_gpu(j))
+            if (j==0 .and. enable_wmles>0 .and. abs(y_gpu(1))<1.e-10_rkind) then
+              ! Non-staggered grid: node 1 sits exactly at the wall, so its true
+              ! control volume is only the upper half-cell (0 to the node1-node2
+              ! midpoint), not the full dy a generic interior node gets. The
+              ! generic formula below would use y_gpu(2)-y_gpu(0) (reaching into
+              ! the ghost region), halving the effective impact of the wall-model
+              ! tau_wall/q_wall (already substituted into sigx/sigq above) on
+              ! node 1's update. Fixed by using the true half-width here instead.
+              dyhl = 2._rkind/(y_gpu(j+2)-y_gpu(j+1))
+            else
+              dyhl = 2._rkind/(y_gpu(j+2)-y_gpu(j))
+            endif
             fl2o = sigx*dyhl
             fl3o = sigy*dyhl
             fl4o = sigz*dyhl
