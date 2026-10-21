@@ -8669,6 +8669,11 @@ contains
     tauw_wm_gpu(i,k) = tau_wall_wm
     qwall_wm_gpu(i,k) = q_wall_wm
 
+    if ((tau_wall_wm /= tau_wall_wm) .or. (q_wall_wm /= q_wall_wm) .or. abs(tau_wall_wm) > 0.5_rkind) then
+      print *, 'WMLES_ANOMALY i=', i, ' k=', k, ' tau_wall=', tau_wall_wm, ' q_wall=', q_wall_wm, &
+               ' u_hwm=', u_hwm, ' t_hwm=', t_hwm, ' p_hwm=', p_hwm
+    endif
+
     endsubroutine eval_wmles_wall_cuf
 
 endmodule streams_kernels_gpu
