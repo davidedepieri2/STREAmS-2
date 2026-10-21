@@ -241,7 +241,7 @@ contains
         call self%generate_grid_uniform_z()
         select case (self%grid_type)
         case(GRID_UNIFORM)
-          call self%generate_grid_uniform_y()
+          call self%generate_grid_uniform_y(ystaggering)
         case(GRID_CHA)
           call self%generate_grid_cha(grid_vars(1), grid_vars(2),nint(grid_vars(3)), grid_vars(4))
         case(GRID_BL,GRID_SBLI)
@@ -812,20 +812,41 @@ contains
     !
   endsubroutine generate_grid_uniform_x
   !
-  subroutine generate_grid_uniform_y(self)
+  subroutine generate_grid_uniform_y(self, ystaggering)
     class(grid_object), intent(inout) :: self !< The grid.
+    logical, intent(in) :: ystaggering
     real(rkind) :: dy
     integer :: j
     !
-    associate(nymax=>self%nymax, ng => self%ng, yg => self%yg, domain_size => self%domain_size,&
+    associate(nymax=>self%nymax, ng => self%ng, yg => self%yg, yn => self%yn, domain_size => self%domain_size,&
     & is_xyz_periodic => self%is_xyz_periodic)
       !
-      dy = domain_size(2)/(nymax-1)
-      if (is_xyz_periodic(2)) dy = domain_size(2)/nymax
+      if (ystaggering .and. .not.is_xyz_periodic(2)) then
+        ! Cell-centered / staggered: nymax cells of width dy span the domain,
+        ! the wall sits exactly at y=0, midway between the ghost node and node 1
+        ! (matches the convention generate_yg uses for stretched grids, so the
+        ! WMLES wall-face flux injection in visflx_y_cuf is geometrically consistent).
+        dy = domain_size(2)/nymax
+        do j=1,nymax+ng
+          yg(j) = (j-0.5_rkind)*dy
+        enddo
+        do j=1,ng
+          yg(1-j) = -yg(j)
+        enddo
+        ! Face positions (yn(j) is the lower face of cell j, yg(j)=0.5*(yn(j)+yn(j+1))):
+        ! needed by postpro (dstar/theta integration) whenever ystag>0, same convention
+        ! as generate_yg uses for stretched grids.
+        do j=1,nymax+1+ng
+          yn(j) = (j-1)*dy
+        enddo
+      else
+        dy = domain_size(2)/(nymax-1)
+        if (is_xyz_periodic(2)) dy = domain_size(2)/nymax
 
-      do j=1-ng,nymax+ng
-        yg(j) = (j-1)*dy
-      enddo
+        do j=1-ng,nymax+ng
+          yg(j) = (j-1)*dy
+        enddo
+      endif
       !
     endassociate
     !
