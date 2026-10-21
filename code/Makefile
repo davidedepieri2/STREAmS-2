@@ -61,16 +61,16 @@ ifeq (${COMPILE},"nv-cuda") # mpif90 shipped with PGI compiler
     ifeq (${MODE},"opt")
         #OLEVEL = -O3 -Mcuda=cc70,cuda10.1,ptxinfo
         #OLEVEL = -O3 -Mcuda=ccall,cuda$(CUDA_VER)
-        OLEVEL = -O3 -cuda -gpu=ccall,cuda$(CUDA_VER)
+        OLEVEL = -O3 -cuda -gpu=cc80,cuda$(CUDA_VER)
         ifeq (${CUDA_VER},"")
-             OLEVEL = -O3 -cuda -gpu=ccall
+             OLEVEL = -O3 -cuda -gpu=cc80
         endif
     else
         #OLEVEL = -Mcuda=ccall,cuda11.0,ptxinfo -g -Minfo
         #OLEVEL = -Mcuda=ccall,cuda$(CUDA_VER) -g -Minfo
-        OLEVEL = -cuda -gpu=ccall,cuda$(CUDA_VER)
+        OLEVEL = -cuda -gpu=cc80,cuda$(CUDA_VER)
         ifeq (${CUDA_VER},"")
-             OLEVEL = -O3 -cuda -gpu=ccall -g -Minfo #=accel
+             OLEVEL = -O3 -cuda -gpu=cc80 -g -Minfo #=accel
         endif
     endif
 endif
