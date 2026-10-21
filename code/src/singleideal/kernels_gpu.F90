@@ -5084,7 +5084,7 @@ contains
             ! (which assumes a resolved viscous sublayer) with the modeled tau_wall/q_wall,
             ! precomputed by eval_wmles_wall_cuf (matched to the resolved state at jmatch).
             sigx = tauw_wm_gpu(i,k)
-            sigq = qwall_wm_gpu(i,k) + tauw_wm_gpu(i,k)*uup
+            sigq = qwall_wm_gpu(i,k) 
           endif
           if (j>0) then
             fl_gpu(i,j,k,2) = fl_gpu(i,j,k,2) + fl2o-sigx*dyhl
