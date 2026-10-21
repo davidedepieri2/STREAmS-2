@@ -6731,7 +6731,7 @@ contains
             pp = rho*tt*rgas0
             tt = 2._rkind*twall-tt
             ee = get_e_from_temperature_dev(tt, t0, indx_cp_l, indx_cp_r, cv_coeff_gpu,calorically_perfect)
-            rho = pp/tt/rgas0
+            rho = pp/tt/rgas0 !secondo me questa linea non serve
             w_gpu(i,1-l,k,1) = rho
             w_gpu(i,1-l,k,2) = -rho*uu
             w_gpu(i,1-l,k,3) = -rho*vv
