@@ -8195,7 +8195,7 @@ contains
         real(rkind), dimension(1:,1:), intent(in), device :: coeff_deriv1_gpu
         real(rkind), dimension(1:), intent(in), device :: dcsidx_gpu, detady_gpu, dzitdz_gpu
         real(rkind) :: ccl, delta2
-        real(rkind) :: mu_sgs,tt,cploc,rho,nu_sgs,rhokmu
+        real(rkind) :: mu_sgs,tt,cploc,rho
         real(rkind) :: normS, normSd
         real(rkind) :: dudx, dudy, dudz
         real(rkind) :: dvdx, dvdy, dvdz
@@ -8297,12 +8297,12 @@ contains
            ! Compute SGS viscosity
            rho    = w_aux_gpu(i,j,k,1)
            mu_sgs = rho*les_c_wale*les_c_wale*delta2*normSd**3/(normS**5 + sqrt(normSd**5)+eps_small)
-           nu_sgs = mu_sgs/rho
            w_aux_gpu(i,j,k,11)  = mu_sgs
-           !rhokmu = rho*k_sgs/mu_sgs/3._rkind
-           rhokmu = les_c_yoshi*nu_sgs/delta2/3._rkind
-           w_aux_gpu(i,j,k,12) = rhokmu
-           w_aux_gpu(i,j,k,10) = div3l+rhokmu
+           ! issue 4: Yoshizawa's rhokmu is never added to momentum (visflx mode 6 overwrites aux10 =
+           ! div3l right after, discarding it before mode 7 reads aux10), so adding it here only made the
+           ! energy-side k_sgs subtraction in eval_aux_les_cuf inconsistent with momentum. Dropped.
+           w_aux_gpu(i,j,k,12) = 0._rkind
+           w_aux_gpu(i,j,k,10) = div3l
           enddo
          enddo
         enddo
@@ -8325,7 +8325,7 @@ contains
         real(rkind), dimension(1-ng:nx+ng,1-ng:ny+ng), device :: jac_gpu
         real(rkind) :: cli, clj, clk, delta2
         real(rkind) :: ucsi, vcsi, wcsi, ueta, veta, weta, uzit, vzit, wzit
-        real(rkind) :: mu_sgs,tt,cploc,rho,nu_sgs,rhokmu
+        real(rkind) :: mu_sgs,tt,cploc,rho
         real(rkind) :: normS, normSd
         real(rkind) :: dudx, dudy, dudz
         real(rkind) :: dvdx, dvdy, dvdz
@@ -8442,12 +8442,12 @@ contains
            ! Compute SGS viscosity
            rho    = w_aux_gpu(i,j,k,1)
            mu_sgs = rho*les_c_wale*les_c_wale*delta2*normSd**3/(normS**5 + sqrt(normSd**5)+eps_small)
-           nu_sgs = mu_sgs/rho
            w_aux_gpu(i,j,k,11)  = mu_sgs
-           !rhokmu = rho*k_sgs/mu_sgs/3._rkind
-           rhokmu = les_c_yoshi*nu_sgs/delta2/3._rkind
-           w_aux_gpu(i,j,k,12) = rhokmu
-           w_aux_gpu(i,j,k,10) = div3l+rhokmu
+           ! issue 4: Yoshizawa's rhokmu is never added to momentum (visflx mode 6 overwrites aux10 =
+           ! div3l right after, discarding it before mode 7 reads aux10), so adding it here only made the
+           ! energy-side k_sgs subtraction in eval_aux_les_cuf inconsistent with momentum. Dropped.
+           w_aux_gpu(i,j,k,12) = 0._rkind
+           w_aux_gpu(i,j,k,10) = div3l
 
           enddo
          enddo
@@ -8468,7 +8468,7 @@ contains
         real(rkind),    dimension(1-ng:,1-ng:,1-ng:, 1:), intent(inout), device :: w_aux_gpu
         integer(ikind)                        :: i, j, k, ll
         real(rkind)                           :: rho, rhou, rhov, rhow, rhoe, ri, uu, vv, ww, qq, pp, tt
-        real(rkind)                           :: mu, ee, cploc, mu_sgs, nu_sgs, k_sgs, rhokmu, delta2
+        real(rkind)                           :: mu, ee, mu_sgs, delta2
         integer(ikind)                        :: iercuda
 
         !$cuf kernel do(3) <<<*,*>>>
@@ -8480,11 +8480,12 @@ contains
               vv     = w_aux_gpu(i,j,k,3)
               ww     = w_aux_gpu(i,j,k,4)
               mu_sgs = w_aux_gpu(i,j,k,11)
-              nu_sgs = mu_sgs/rho
-              k_sgs  = 3._rkind*w_aux_gpu(i,j,k,12)*nu_sgs
               rhoe   = w_gpu(i,j,k,5)
               qq     = 0.5_rkind*(uu*uu+vv*vv+ww*ww)
-              ee     = rhoe/rho-qq-k_sgs
+              ! issue 4: Yoshizawa k_sgs dropped from the energy too -- it already never reached momentum
+              ! (visflx mode 6 overwrites aux10 = div3l, discarding the rhokmu this model added to it), so
+              ! subtracting it only here was a one-sided, inconsistent treatment, not a deliberate asymmetry.
+              ee     = rhoe/rho-qq
               tt     = get_temperature_from_e_dev(ee, w_aux_gpu(i,j,k,6), t0, cv_coeff_gpu, indx_cp_l, indx_cp_r, &
                                                   calorically_perfect, tol_iter_nr)
               pp = rho*tt*rgas0
@@ -8501,17 +8502,15 @@ contains
                   mu = 0._rkind
               endif
               mu_sgs = min(mu_sgs,200._rkind*mu)
+              ! issue 5: write the capped value back to aux11 so visflx_{x,y,z}_cuf's heat-flux split
+              ! (which reads aux11 for mu_sgsf) stays consistent with aux7 = mu+mu_sgs below; previously
+              ! aux11 kept the raw, uncapped WALE value forever, so (muf-mu_sgsf) could go negative.
+              w_aux_gpu(i,j,k,11) = mu_sgs
               w_aux_gpu(i,j,k,7) = mu+mu_sgs
-              if (calorically_perfect==1) then
-               cploc = cp_coeff_gpu(0)
-              else
-               cploc = 0._rkind
-               do ll=indx_cp_l,indx_cp_r
-                cploc = cploc+cp_coeff_gpu(ll)*(tt/t0)**ll
-               enddo
-              endif
-              w_aux_gpu(i,j,k,8) = mu*cploc/Prandtl+mu_sgs*cploc/les_pr
-              ! STREAMS v1.0 : mu0 = sqgmr  ;  ggmopr = cp/Pr ; k = sqgmr * ggmopr
+              ! issue 3: aux8 is the Ducros shock sensor (written by sensor_cuf/visflx mode=3, read by
+              ! euler_{x,y,z} to switch WENO/central). This kernel used to overwrite it every sub-step
+              ! with a conductivity value nothing else reads as such, before euler_x ever ran -- silently
+              ! disabling the sensor. Nothing else uses aux8 as a conductivity, so the write is just deleted.
           enddo
          enddo
         enddo
@@ -8643,10 +8642,194 @@ contains
 
     endsubroutine odewmles_ref
 
+    attributes(device) subroutine odewmles_rough(Prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+                      calorically_perfect,sutherland_S,u_inf,hw,u_p,T_w,T_h,p_h,tau_wall,q_wall,k,lf)
+        implicit none
+
+        real(rkind)                 , value :: Prandtl, mu0, t0, u_inf,rgas0
+        real(rkind)                 , value :: T_ref_dim,sutherland_S
+        real(rkind)                 , value :: hw, u_p, T_h, p_h,  T_w
+        real(rkind)                 , value :: k,lf
+        integer, value :: calorically_perfect, indx_cp_l, indx_cp_r
+        real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in) :: cp_coeff_gpu
+
+        real(rkind), intent(out) :: tau_wall, q_wall
+
+        integer, parameter :: nw = 3000
+
+        ! local declarations
+        integer, parameter :: max_iter_sec = 15
+        real(rkind), parameter :: toll = 1.0E-08_rkind
+        integer , parameter :: itmx = 10
+        real(rkind)            :: c_p
+        real(rkind)            :: rerr
+        real(rkind) :: rhow,muw,rho_m1,mu_m1,y_sl_m1,mu_t
+        real(rkind) :: utau,l_visc,dy,y_half,f,y_sl_half,detA,a_,b_
+        real(rkind) :: dysl,drho_dy,dmu_dy,dU_incomp_dysl,dUp_dysl,dT_du_w
+        real(rkind) :: rho,mu,mue,mu_half,y_sl,T_next,utau_prev,r,Ue,Te,Me
+        real(rkind) :: rho_half,rhoe,T_prev,utau_next,U_end_prev,Tr,dfu,dfT,klW
+        real(rkind), parameter :: kappa = 0.41, A_plus = 17
+        real(rkind), parameter :: gamma0=1.4_rkind
+        real(rkind), parameter :: tol_u = 1.0e-4,tol_T = 1.0e-4, step_ctl_fax =0.1
+        !real(rkind), parameter :: k = 0.12
+        real(rkind)                  :: tauW, qauW
+        integer, parameter :: max_iter = 30,relax_u = 1,relax_T =1
+        integer :: iter,i_y,iter_sec,ii,j
+        ! local declarations
+        real(rkind), dimension(0:nw) :: yf,u_sol,T_sol
+        real(rkind), dimension(1:nw) :: yc
+        real(rkind), dimension(1:nw) :: dy_vec
+        real(rkind)                  :: dy_wall
+        real(rkind)                  :: rsOld, rs,T_k,T_r
+        real(rkind)                  :: s_Pr,utau_est,tauw_est,a
+        real(rkind) :: lx,a_min,c_theta,cd,Pi,utau_Uh,tan_theta,hs,d_h,z0_h,d
+        real(rkind) :: Uh,du_dy,Ttau,rg
+
+        s_Pr=1.14*Prandtl
+        c_p = gamma0/(gamma0-1._rkind)
+
+        !Geometry pre-step
+        lx = 2*k
+        !lf = 1._rkind/9._rkind !solidità frontale
+        a_min = 0.4 !coefficiente di attenuazione del paper, valido nei casi 'just sheltered'
+        c_theta = 1 !c'è una formula approssimativa per calcolarlo in funzione di h/w, nel nostro caso vale 1
+        cd = 1 !il paper lo prende come 1
+        Pi = 0.2 !coefficiente del wake per il profilo di velocità
+
+        !TROVO IL VALORE CORRETTO DI utau/Uh DALLE EQUAZIONI (3.4)(3.7)(3.8). LA (3.5) NON SI PUO' USARE!!!!!
+        utau_Uh=0.1 !valore iniziale su cui iterare
+        do ii =1,20 !10 step per trovare il rapporto u_tau/U_h corretto
+            tan_theta = c_theta*utau_Uh !equazione 3.16
+            hs = max(k-tan_theta*lx,0._rkind) !3.17
+            a = a_min/(1-hs/k) !3.15
+            d_h = 1/(1-exp(-2*a))-1/(2*a) !equazione 3.7
+            z0_h = (1-d_h)*exp(-kappa/sqrt(1/(2*a)*cd*lf*(1-exp(-2*a)))) !3.8 in teoria posso usarla
+            d = d_h*k !3.7
+            utau_Uh = kappa/log((k-d)/(z0_h*k)) !3.4
+        enddo
+
+        if((hw-k)<0._rkind) print*, 'error grid'
+
+        Te = t0
+        Ue = u_inf
+        Me = Ue/sqrt(gamma0*Te)
+        rhow = p_h/T_w
+        utau_est = utau_Uh*u_p
+        tauw_est = utau**2*rhow
+        rhoe = p_h/Te
+        muw  = mu0 * (T_w/t0)**1.5_rkind * &
+               (1._rkind+sutherland_S/T_ref_dim)/(T_w/t0 + sutherland_S/T_ref_dim)
+        klW  = c_p*muw/Prandtl
+        mue  = mu0
+        r    = Prandtl**(1./3.)
+        Tr = Te*(1+r*(gamma0-1)/2*Me**2)
+        tauW = muw*u_p/hw
+        utau = sqrt(abs(tauW)/rhow)
+        utau_prev = utau
+        qauW = c_p*muw/Prandtl*(Tr-T_w)/hw+1e-4
+        qauW = c_p*muw/Prandtl*T_h/hw
+        Ttau = -qauW/(c_p*rhow*utau)
+        rg = Prandtl**(1._rkind/3._rkind)
+
+        detA = u_p * (Ue**2) - (u_p**2) * Ue
+
+        if (abs(detA) < 1.0e-12) print *, "Error: determinant is zero"
+
+        !a_ = ((T_h - T_w) * (Ue**2) - (Te - T_w) * (u_p**2)) / detA
+        !b_ = (u_p * (Te - T_w) - Ue * (T_h - T_w)) / detA
+
+        T_r = Te + r * Ue**2 / (2*c_p)
+        a_ = (T_r - T_w) / Ue
+        b_ = (Te - T_r) / Ue**2
+
+        iter_sec = 1
+
+        u_sol = 0._rkind
+        T_sol = 0._rkind
+        do iter = 1,max_iter
+         rho_m1 = rhow
+         mu_m1 = muw
+         utau_Uh = kappa/log((k-d)/(z0_h*k))
+         Uh = utau/utau_Uh
+         l_visc = muw/rhow/utau
+         dy = l_visc*0.6
+         u_sol(0) = Uh
+         T_sol(0) = T_w+a_*Uh+b_*Uh**2
+         T_k = T_sol(0)
+         yf(0) = k
+         j=0
+         do while(yf(j)<hw)
+          dy = max(dy,(hw-k)/200._rkind)
+          dy = min(dy,hw-yf(j),dy)
+          y_half    = yf(j) + 0.5*dy
+          j = j + 1
+          yf(j) = yf(j-1) + dy
+          T_sol(j) = T_sol(j-1)
+          T_prev = T_sol(j)
+          do iter_sec=1,max_iter_sec
+           rho = T_w/T_sol(j)*rhow
+           mu  = mu0 * (T_sol(j)/t0)**1.5_rkind * &
+                 (1._rkind+sutherland_S/T_ref_dim)/(T_sol(j)/t0 + sutherland_S/T_ref_dim)
+           rho_half = 0.5_rkind*(rho+rho_m1)
+           mu_half = 0.5_rkind*(mu+mu_m1)
+
+           du_dy = utau/(kappa*(y_half-d))
+
+           u_sol(j) = u_sol(j-1) + dy*du_dy/sqrt(rho_half/rhow)
+           !T_next = T_w +Prandtl*u_sol(j)/utau*Ttau-rg*u_sol(j)**2/(2*c_p)
+           !tauW = rhow*utau**2
+           T_next = T_w + a_*u_sol(j) + b_*u_sol(j)**2
+           T_sol(j) = T_prev + relax_T*(T_next-T_prev)
+           T_sol(j) = max(T_sol(j),0._rkind)
+
+           if ((T_sol(j)-T_prev)**2/T_sol(j)**2 < tol_T) exit
+           T_prev = T_sol(j)
+          enddo
+
+
+         !if (iter_sec == max_iter_sec) print*, 'err'
+         rho_m1 = rho
+         mu_m1 = mu
+         enddo
+
+         if (abs(yf(j)-hw)/hw > 1.0e-8) print*, 'error 1'
+
+         if (iter.eq.1) then
+           utau_next = utau*1.1_rkind
+         else
+           utau_next = utau + relax_u*(u_p-u_sol(j))*(utau-utau_prev)/(u_sol(j)-U_end_prev)
+         endif
+
+         U_end_prev = u_sol(j)
+         utau_prev = utau
+
+         if (abs(u_p-u_sol(j))/u_p < tol_u) then
+          utau = utau_next
+          tauW = rhow*utau**2
+          exit
+         endif
+         utau = utau_next
+         tauW = rhow*utau**2
+         qauW = Ttau*c_p*rhow*utau
+         rg = (T_w-Te)/(Ue**2/(2*c_p))-2*Prandtl*qauW/(Ue*tauW)
+         Ttau = (T_k+rg*Uh**2/(2*c_p)-T_w)/Prandtl*utau_Uh
+
+        enddo
+
+
+        qauW = Ttau*c_p*rhow*utau
+
+        tau_wall = tauW
+        q_wall   = qauW
+
+
+
+    endsubroutine odewmles_rough
+
     attributes(global) subroutine eval_wmles_wall_cuf(nx, nz, ng, jmatch, wmles_model, twall, &
                       prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
                       cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
-                      y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu)
+                      y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf)
     ! Precomputes the wall-modeled tau_wall/q_wall for every (i,k) wall-parallel
     ! column, once per RK substep, ahead of visflx_y_cuf (which just reads the result
     ! at the wall face). Kept as a separate global kernel because NVFORTRAN does not
@@ -8655,8 +8838,9 @@ contains
     implicit none
     integer, value :: nx, nz, ng, jmatch, wmles_model, indx_cp_l, indx_cp_r, calorically_perfect
     real(rkind), value :: twall, prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0
+    real(rkind), value :: x_rough, k_rough, lf
     real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in) :: cp_coeff_gpu
-    real(rkind), dimension(1-ng:), intent(in) :: y_gpu
+    real(rkind), dimension(1-ng:), intent(in) :: y_gpu, x_gpu
     real(rkind), dimension(1-ng:,1-ng:,1-ng:,1:), intent(in) :: w_aux_gpu
     real(rkind), dimension(1:,1:), intent(out) :: tauw_wm_gpu, qwall_wm_gpu
     integer :: i, k
@@ -8675,6 +8859,16 @@ contains
     case(1)
       call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
            calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
+    case(3)
+      ! EWM upstream of x_rough, roughness model downstream -- same node-1 flux
+      ! substitution mechanism as case(1), just a different per-column tau_w/q_w source.
+      if (x_gpu(i) < x_rough) then
+        call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+             calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
+      else
+        call odewmles_rough(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+             calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm,k_rough,lf)
+      endif
     end select
 
     tauw_wm_gpu(i,k) = tau_wall_wm

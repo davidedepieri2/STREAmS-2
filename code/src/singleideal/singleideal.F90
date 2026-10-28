@@ -73,6 +73,7 @@ module streams_equation_singleideal_object
     integer(ikind) :: enable_wmles = 0
     integer(ikind) :: wmles_model
     integer(ikind) :: jmatch
+    real(rkind) :: x_rough, k_rough, lf
     integer(ikind) :: weno_scheme, weno_version, flux_splitting
     real(rkind) :: sensor_threshold
     real(rkind) :: xshock_imp, shock_angle, tanhfacs
@@ -135,6 +136,8 @@ module streams_equation_singleideal_object
     integer :: correct_bound_ord
 
     real(rkind), dimension(:,:,:), allocatable :: w_stat, w_stat_z
+    real(rkind), dimension(:,:,:), allocatable :: wmles_out        ! (2,nx,nz): 1=tau_w, 2=q_w, host copy of tauw_wm_gpu/qwall_wm_gpu
+    real(rkind), dimension(:,:), allocatable :: wm_stat, wm_stat_z ! (2,nx): running time average / current z-average
     real(rkind), dimension(:,:,:,:), allocatable :: w_stat_3d
     logical :: save_stat_z
 
@@ -251,13 +254,16 @@ module streams_equation_singleideal_object
     procedure, pass(self) :: alloc
     procedure, pass(self) :: bc_preproc
     procedure, pass(self) :: compute_stats
+    procedure, pass(self) :: compute_stats_wm
     procedure, pass(self) :: compute_stats_c2
     procedure, pass(self) :: compute_airfoil_forces
     procedure, pass(self) :: write_stats
+    procedure, pass(self) :: write_stats_wm
     procedure, pass(self) :: write_stats_z
     procedure, pass(self) :: write_stats_serial
     procedure, pass(self) :: write_stats_z_serial
     procedure, pass(self) :: read_stats
+    procedure, pass(self) :: read_stats_wm
     procedure, pass(self) :: read_stats_serial
     procedure, pass(self) :: compute_stats_3d
     procedure, pass(self) :: write_stats_3d
@@ -302,6 +308,7 @@ contains
     real(rkind) :: domain_size_x, domain_size_y, domain_size_z, rtemp, wind
     real(rkind), dimension(:), allocatable :: grid_vars
     logical :: rebuild_ghost, ystaggering
+    logical :: wmstat_file_exists
     integer :: bctag_temp, order, itemp
     real(rkind) :: d1_temp(1:4), d2_temp(0:4)
     integer :: i, grid2d_par, save_metrics_2d, istat
@@ -482,6 +489,30 @@ contains
     self%nv_aux = 10
     if (self%cfg%has_key("lespar","enable_les")) then
      call self%cfg%get("lespar","enable_les",self%enable_les)
+    endif
+
+!   WMLES (equilibrium wall model), flat wall, no IBM, no roughness. Read early
+!   (before alloc/restart) so allocation sizing and restart-time wm_stat
+!   reset/read can both see the real enable_wmles value, not its default 0.
+    if (self%cfg%has_key("wmlespar","enable_wmles")) then
+     call self%cfg%get("wmlespar","enable_wmles",self%enable_wmles)
+    endif
+    if (self%enable_wmles>0) then
+     call self%cfg%get("wmlespar","wmles_model",self%wmles_model)
+     call self%cfg%get("wmlespar","jmatch",self%jmatch)
+     select case (self%wmles_model)
+     case(1)
+     case(3)
+      call self%cfg%get("wmlespar","x_rough",self%x_rough)
+      call self%cfg%get("wmlespar","k_rough",self%k_rough)
+      call self%cfg%get("wmlespar","lf",self%lf)
+      if (self%masterproc) write(*,*) 'WMLES model: EWM + rough'
+      if (self%masterproc) write(*,*) 'x_rough = ', self%x_rough
+      if (self%masterproc) write(*,*) 'k_rough = ', self%k_rough
+      if (self%masterproc) write(*,*) 'lf = ', self%lf
+     case default
+      call fail_input_any("WMLES model not implemented")
+     end select
     endif
     if (self%enable_les>0) self%nv_aux = self%nv_aux+2
     if(self%grid%grid_dim == 1) then
@@ -743,6 +774,7 @@ contains
         self%time_insitu = 0._rkind
       endif
       self%w_stat = 0._rkind
+      self%wm_stat = 0._rkind
       if (self%enable_stat_3d>0) self%w_stat_3d = 0._rkind
       if (self%enable_tspec>0) then
         self%it_win1_tspec = 1
@@ -764,6 +796,7 @@ contains
       self%itav = 0
       self%itslice_p3d = 0
       self%w_stat = 0._rkind
+      self%wm_stat = 0._rkind
       if (self%enable_stat_3d>0) self%w_stat_3d = 0._rkind
       if (self%enable_tspec>0) then
         self%it_win1_tspec = 1
@@ -792,6 +825,11 @@ contains
           call self%field%read_field()
         endif
         if (self%enable_stat_time>0) call self%read_stats()
+        if (self%enable_stat_time>0 .and. self%enable_wmles>0) then
+          inquire(file='stat_wmles.bin', exist=wmstat_file_exists)
+          if (.not. wmstat_file_exists) call fail_input_any("stat_wmles.bin missing: restart once with restart_type=1 to start the wall-model average")
+          call self%read_stats_wm()
+        endif
         if (self%enable_stat_3d>0) call self%read_stats_3d()
       endif
 
@@ -881,6 +919,11 @@ contains
      call self%cfg%get("lespar","les_model",self%les_model)
      call self%cfg%get("lespar","les_pr",self%les_pr)
      call self%cfg%get("lespar","les_c_yoshi",self%les_c_yoshi)
+     if (self%les_c_yoshi>0._rkind .and. self%conservative_viscous==1 .and. self%masterproc) then
+      write(*,*) 'Warning: les_c_yoshi>0 with conservative_viscous=1 has no effect on momentum &
+                  &(the Yoshizawa k_sgs stress is dropped before it reaches the momentum equation); &
+                  &it is also no longer subtracted from the internal energy (issue 4 fix).'
+     endif
      select case (self%les_model)
      case(1)
       if (self%masterproc) write(*,*) 'LES model: WALE'
@@ -892,22 +935,6 @@ contains
       if (self%masterproc) write(*,*) 'Changing mode async to 0 for LES'
       self%mode_async = 0
      endif
-    endif
-
-!   WMLES (equilibrium wall model), flat wall, no IBM, no roughness
-    if (self%cfg%has_key("wmlespar","enable_wmles")) then
-     call self%cfg%get("wmlespar","enable_wmles",self%enable_wmles)
-    endif
-    if (self%enable_wmles>0) then
-     call self%cfg%get("wmlespar","wmles_model",self%wmles_model)
-     call self%cfg%get("wmlespar","jmatch",self%jmatch)
-     select case (self%wmles_model)
-     case(1)
-      if (self%masterproc) write(*,*) 'WMLES model: EWM'
-     case default
-      call fail_input_any("WMLES model not implemented")
-     end select
-     if (self%masterproc) write(*,*) 'WMLES matching node jmatch =', self%jmatch
     endif
 
   endsubroutine initialize
@@ -1645,6 +1672,10 @@ contains
       self%w_aux = 0
       allocate(self%w_stat(nv_stat, 1:nx, 1:ny))
       allocate(self%w_stat_z(nv_stat, 1:nx, 1:ny))
+      allocate(self%wmles_out(2, 1:nx, 1:nz))
+      allocate(self%wm_stat(2, 1:nx))
+      allocate(self%wm_stat_z(2, 1:nx))
+      self%wm_stat = 0._rkind
       allocate(self%fluid_mask(1-ng:nx+ng, 1-ng:ny+ng, 1-ng:nz+ng))
       allocate(self%ep_ord_change(0:nx, 0:ny, 0:nz, 1:3))
       allocate(self%wallprop(1-ng:nx+ng, 1-ng:nz+ng, 2:4))
@@ -1746,6 +1777,61 @@ contains
     endassociate
 
   endsubroutine read_stats
+
+  subroutine read_stats_wm(self)
+    class(equation_singleideal_object), intent(inout) :: self
+    integer, dimension(3) :: sizes
+    integer, dimension(3) :: subsizes
+    integer, dimension(3) :: starts
+    integer :: ntotxy
+    integer, dimension(mpi_status_size) :: istatus
+    integer :: mpi_io_file
+    integer :: filetype, l, m
+    integer :: size_real
+    integer (kind=mpi_offset_kind) :: offset
+    character(len=256) :: oldname, newname
+    associate(nx => self%field%nx, wm_stat => self%wm_stat, mp_cartx => self%field%mp_cartx,&
+    & mp_cartz => self%field%mp_cartz, ncoords => self%field%ncoords, nblocks => self%field%nblocks,&
+    & iermpi => self%mpi_err)
+      if (ncoords(3)==0) then
+        sizes(1) = nblocks(1)*nx
+        sizes(2) = 1
+        sizes(3) = 1
+        subsizes(1) = nx
+        subsizes(2) = 1
+        subsizes(3) = 1
+        starts(1) = 0 + ncoords(1)*subsizes(1)
+        starts(2) = 0
+        starts(3) = 0
+        ntotxy = nx
+
+        call mpi_type_create_subarray(3,sizes,subsizes,starts,mpi_order_fortran,mpi_prec,filetype,iermpi)
+        call mpi_type_commit(filetype,iermpi)
+        call mpi_file_open(mp_cartx,'stat_wmles.bin',mpi_mode_rdonly,mpi_info_null,mpi_io_file,iermpi)
+        offset = 0
+        do l=1,2
+          call mpi_file_set_view(mpi_io_file,offset,mpi_prec,filetype,"native",mpi_info_null,iermpi)
+          call mpi_file_read_all(mpi_io_file,wm_stat(l,1:nx),ntotxy,mpi_prec,istatus,iermpi)
+          call mpi_type_size(mpi_prec,size_real,iermpi)
+          do m=1,nblocks(1)
+            offset = offset+size_real*ntotxy
+          enddo
+        enddo
+
+        call mpi_file_close(mpi_io_file,iermpi)
+        call mpi_type_free(filetype,iermpi)
+      endif
+      call mpi_bcast(wm_stat,2*nx,mpi_prec,0,mp_cartz,iermpi)
+      call mpi_barrier(mpi_comm_world, iermpi)
+      if (self%masterproc) then
+        oldname = c_char_"stat_wmles.bin"//c_null_char
+        newname = c_char_"stat_wmles.bak"//c_null_char
+        iermpi = rename_wrapper(oldname, newname)
+        if (iermpi /= 0) write(error_unit,*) "Warning! Cannot rename file stat_wmles.bin to stat_wmles.bak"
+      endif
+      call mpi_barrier(mpi_comm_world, iermpi)
+    endassociate
+  endsubroutine read_stats_wm
 
   subroutine read_stats_serial(self)
     class(equation_singleideal_object), intent(inout) :: self
@@ -1869,6 +1955,50 @@ contains
       endif
     endassociate
   endsubroutine write_stats
+
+  subroutine write_stats_wm(self)
+    class(equation_singleideal_object), intent(inout) :: self
+    integer, dimension(3) :: sizes
+    integer, dimension(3) :: subsizes
+    integer, dimension(3) :: starts
+    integer :: ntotxy
+    integer, dimension(mpi_status_size) :: istatus
+    integer :: mpi_io_file
+    integer :: filetype, l, m
+    integer :: size_real
+    integer (kind=mpi_offset_kind) :: offset
+    associate(nx => self%field%nx, wm_stat => self%wm_stat, mp_cartx => self%field%mp_cartx,&
+    & ncoords => self%field%ncoords, nblocks => self%field%nblocks, iermpi => self%mpi_err)
+      if (ncoords(3)==0) then
+        sizes(1) = nblocks(1)*nx
+        sizes(2) = 1
+        sizes(3) = 1
+        subsizes(1) = nx
+        subsizes(2) = 1
+        subsizes(3) = 1
+        starts(1) = 0 + ncoords(1)*subsizes(1)
+        starts(2) = 0
+        starts(3) = 0
+        ntotxy = nx
+
+        call mpi_type_create_subarray(3,sizes,subsizes,starts,mpi_order_fortran,mpi_prec,filetype,iermpi)
+        call mpi_type_commit(filetype,iermpi)
+        call mpi_file_open(mp_cartx,'stat_wmles.bin',mpi_mode_create+mpi_mode_wronly,mpi_info_null,mpi_io_file,iermpi)
+        offset = 0
+        do l=1,2
+          call mpi_file_set_view(mpi_io_file,offset,mpi_prec,filetype,"native",mpi_info_null,iermpi)
+          call mpi_file_write_all(mpi_io_file,wm_stat(l,1:nx),ntotxy,mpi_prec,istatus,iermpi)
+          call mpi_type_size(mpi_prec,size_real,iermpi)
+          do m=1,nblocks(1)
+            offset = offset+size_real*ntotxy
+          enddo
+        enddo
+
+        call mpi_file_close(mpi_io_file,iermpi)
+        call mpi_type_free(filetype,iermpi)
+      endif
+    endassociate
+  endsubroutine write_stats_wm
 
   subroutine write_stats_z(self)
     class(equation_singleideal_object), intent(inout) :: self
@@ -2226,6 +2356,30 @@ contains
       w_stat = w_stat/(itav+1)
     endassociate
   endsubroutine compute_stats
+
+  subroutine compute_stats_wm(self)
+    class(equation_singleideal_object), intent(inout) :: self
+    real(rkind) :: tauw, qauw
+    integer :: i, k, npt
+    associate(nx => self%field%nx, nz => self%field%nz, nzmax => self%grid%nzmax, itav => self%itav,&
+    & wm_stat => self%wm_stat, wm_stat_z => self%wm_stat_z, wmles_out => self%wmles_out,&
+    & mp_cartz => self%field%mp_cartz, mpi_err => self%mpi_err)
+      wm_stat_z = 0._rkind
+      do k=1,nz
+        do i=1,nx
+          tauw = wmles_out(1,i,k)
+          qauw = wmles_out(2,i,k)
+          wm_stat_z(1,i) = wm_stat_z(1,i)+tauw
+          wm_stat_z(2,i) = wm_stat_z(2,i)+qauw
+        enddo
+      enddo
+      npt = 2*nx
+      call mpi_allreduce(MPI_IN_PLACE,wm_stat_z,npt,mpi_prec,mpi_sum,mp_cartz,mpi_err)
+      wm_stat_z = wm_stat_z/nzmax
+      wm_stat = wm_stat*itav + wm_stat_z
+      wm_stat = wm_stat/(itav+1)
+    endassociate
+  endsubroutine compute_stats_wm
 
   subroutine compute_airfoil_forces(self)
     class(equation_singleideal_object), intent(inout) :: self

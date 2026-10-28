@@ -42,5 +42,10 @@ integer                                    :: save_plot3d
 integer                                    :: io_type_w
 integer                                    :: mpi_split_x
 integer                                    :: it_start, it_end, it_out
-integer, dimension(:), allocatable         :: plot3d_vars 
+integer, dimension(:), allocatable         :: plot3d_vars
+
+integer                                    :: enable_wmles
+real(rkind), dimension(:), allocatable     :: tauw_wm, qwall_wm ! wall model's own time-averaged tau_w(x), q_w(x) from stat_wmles.bin
+integer                                    :: jmatch
+real(rkind)                                :: s_suth, T_ref
 end module

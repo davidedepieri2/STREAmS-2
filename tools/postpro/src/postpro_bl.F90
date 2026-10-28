@@ -13,6 +13,11 @@ module postpro_bl
  integer :: i,j,m,j99,ii,jint
  real(rkind), dimension(nx,ny) :: ufav,vfav,wfav,tfav,dufavdy
  real(rkind), dimension(nx) :: d99_vec,deltav_vec,utau_vec,rhow_vec,ttw_vec,dudyw_vec,rmuw_vec
+ real(rkind), dimension(nx) :: dstar_vec,theta_vec,dstarinc_vec,thetainc_vec,shapef_vec,shapefinc_vec
+ real(rkind), dimension(nx) :: ppw_vec,prmsp_vec,cf_vec,cfinc_vec,redelta99_vec,retheta_vec
+ real(rkind), dimension(nx) :: redelta2_vec,bq_vec,ch_vec,cfproxy_vec,cfvk_vec,dthetadx_vec,retau_vec
+ real(rkind), dimension(nx) :: rhowproxy_vec,rmuwproxy_vec
+ real(rkind) :: tauw_proxy,qw_proxy,rhow_proxy,rmuw_proxy,rlamw_proxy,p_match
  real(rkind), dimension(naux,ny) :: vaux
  real(rkind), dimension(ny) :: yt,yh,yvd,yv,uv,ut,uvd,uh,duvddy,dutdy
  real(rkind), dimension(ny) :: duvdy,duhdy,dugdy,ybig,ut_2,ug,dybigdy
@@ -89,9 +94,30 @@ module postpro_bl
     rnuw  = rmuw/rhow
    endif
    ttw    = Twall ! overwrite Twall with exact boundary condition
-   rlamw  = rmuw*gam/(gam-1._rkind)/Prandtl
-   tauw   = rmuw*dudyw
-   qw     = -rlamw*dtdyw
+   rhow_proxy  = rhow  ! proxy: extrapolated/read directly from the resolved density field
+   rmuw_proxy  = rmuw  ! proxy: extrapolated/read directly from the resolved viscosity field
+   rlamw_proxy = rmuw_proxy*gam/(gam-1._rkind)/Prandtl
+   tauw_proxy = rmuw_proxy*dudyw ! proxy: recomputed from the resolved mean-velocity-field gradient
+   qw_proxy   = -rlamw_proxy*dtdyw
+   if (enable_wmles>0) then
+    ! Wall model's own internal convention (odewmles_ref/odewmles_rough, kernels_gpu.F90):
+    ! rho_w = p(y_match)/T_w and mu_w = Sutherland(T_w), i.e. dp/dy=0 assumed between the
+    ! wall and the matching height, and mu_sgs=0 at the wall (WALE). Using the same
+    ! convention here keeps utau/deltav/y+/Re_tau consistent with what the model itself
+    ! computes internally, instead of the proxy's density-field extrapolation (which has
+    ! to track a much steeper near-wall gradient than the near-constant wall-layer pressure).
+    p_match = wstat(i,jmatch,5)
+    rhow  = p_match/ttw
+    rmuw  = mu0*(ttw/t0)**1.5_rkind*(1._rkind+s_suth/T_ref)/(ttw/t0+s_suth/T_ref)
+    tauw  = tauw_wm(i)   ! wall model's own time-averaged flux (stat_wmles.bin), not a proxy
+    qw    = qwall_wm(i)
+   else
+    rhow  = rhow_proxy
+    rmuw  = rmuw_proxy
+    tauw  = tauw_proxy
+    qw    = qw_proxy
+   endif
+   rnuw   = rmuw/rhow
    utau   = sqrt(abs(tauw)/rhow)
    deltav = rnuw/utau
    pdyn  = 0.5_rkind*rho0*u0**2
@@ -196,14 +222,42 @@ module postpro_bl
    rethetainc = ue*rhoe*thetainc/rmue
    redelta2   = ue*rhoe*theta/rmuw ! = retheta*ftheta
 !
+   dstar_vec(i)     = dstar
+   theta_vec(i)     = theta
+   dstarinc_vec(i)  = dstarinc
+   thetainc_vec(i)  = thetainc
+   shapef_vec(i)    = shapef
+   shapefinc_vec(i) = shapefinc
+   ppw_vec(i)       = ppw
+   prmsp_vec(i)     = prmsp
+   cf_vec(i)        = cf
+   cfinc_vec(i)     = cfinc
+   redelta99_vec(i) = redelta99
+   retheta_vec(i)   = retheta
+   redelta2_vec(i)  = redelta2
+   retau_vec(i)     = retau
+   bq_vec(i)        = Bq
+   ch_vec(i)        = ch
+   cfproxy_vec(i)   = tauw_proxy/pdyn
+   rhowproxy_vec(i) = rhow_proxy
+   rmuwproxy_vec(i) = rmuw_proxy
+  enddo
+!
+! cf_vk = 2*dtheta/dx : von Karman momentum-integral estimate, for comparison only
+  call ddy(nx,theta_vec,x(1:nx),2,dthetadx_vec)
+  cfvk_vec = 2._rkind*dthetadx_vec
+!
+  do i=1,nx
    !write(10,100) x(i),cf,retau,shapef,shapefinc,delta99,dstar,theta,utau/u0,rethetainc,&
    !              cfinc,redelta2,prmsp,ch,retheta
    !              1      2      3     4       5        6       7       8
-   write(10,100) x(i),delta99,dstar,theta,dstarinc,thetainc,shapef,shapefinc, &
-   !                    9   10  11   12    13    14   15  
-                      rhow,ttw,ppw,prmsp,utau/u0,cf,cfinc, &
+   write(10,100) x(i),d99_vec(i),dstar_vec(i),theta_vec(i),dstarinc_vec(i),thetainc_vec(i),shapef_vec(i),shapefinc_vec(i), &
+   !                    9   10  11   12    13    14   15
+                      rhow_vec(i),ttw_vec(i),ppw_vec(i),prmsp_vec(i),utau_vec(i)/u0,cf_vec(i),cfinc_vec(i), &
    !                      16      17       18      19  20 21
-                      redelta99,retheta,redelta2,retau,Bq,ch
+                      redelta99_vec(i),retheta_vec(i),redelta2_vec(i),retau_vec(i),bq_vec(i),ch_vec(i), &
+   !                      22          23            24               25
+                      cfproxy_vec(i),cfvk_vec(i),rhowproxy_vec(i),rmuwproxy_vec(i)
   enddo
   close(10)
 !

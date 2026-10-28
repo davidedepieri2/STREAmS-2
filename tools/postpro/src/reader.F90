@@ -34,6 +34,15 @@ contains
         if (cfg%has_key("curvi","R_curv")) call cfg%get("curvi","R_curv",R_curv)
         aoa = 0._rkind
         if (cfg%has_key("flow","aoa")) call cfg%get("flow","aoa",aoa)
+        enable_wmles = 0
+        if (cfg%has_key("wmlespar","enable_wmles")) then
+         call cfg%get("wmlespar","enable_wmles",enable_wmles)
+        endif
+        if (enable_wmles>0) then
+         call cfg%get("wmlespar","jmatch",jmatch)
+         call cfg%get("fluid","s_suth",s_suth)
+         call cfg%get("flow","T_ref",T_ref)
+        endif
         nxb = nx/mpi_split_x
         !
         ! rfac  = Prandtl**(1._rkind/3._rkind)
@@ -313,6 +322,17 @@ contains
         endif
         !
     end subroutine read_stat
+
+    subroutine read_stat_wmles
+        implicit none
+        allocate(tauw_wm(nx))
+        allocate(qwall_wm(nx))
+        print*,'Reading stat_wmles.bin'
+        open(10,file='stat_wmles.bin',form='unformatted',access='stream')
+        read(10) tauw_wm
+        read(10) qwall_wm
+        close(10)
+    end subroutine read_stat_wmles
 
     subroutine save_plot3d_fields()
         integer :: n_vars, i, j, ii, i_var

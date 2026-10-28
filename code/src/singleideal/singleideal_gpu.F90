@@ -409,14 +409,16 @@ contains
                 indx_cp_r => self%equation_base%indx_cp_r, &
                 calorically_perfect => self%equation_base%calorically_perfect, &
                 y_gpu => self%base_gpu%y_gpu, w_aux_gpu => self%w_aux_gpu, &
-                tauw_wm_gpu => self%tauw_wm_gpu, qwall_wm_gpu => self%qwall_wm_gpu)
+                tauw_wm_gpu => self%tauw_wm_gpu, qwall_wm_gpu => self%qwall_wm_gpu, &
+                x_gpu => self%base_gpu%x_gpu, x_rough => self%equation_base%x_rough, &
+                k_rough => self%equation_base%k_rough, lf => self%equation_base%lf)
 
       blockDim = dim3(16,16,1)
       gridDim = dim3(ceiling(real(nx)/blockDim%x),ceiling(real(nz)/blockDim%y),1)
       call eval_wmles_wall_cuf<<<gridDim, blockDim>>>(nx, nz, ng, jmatch, wmles_model, twall, &
            Prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
            cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
-           y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu)
+           y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf)
 
       endassociate
   endsubroutine eval_wmles_wall
@@ -1788,6 +1790,7 @@ contains
       if (self%equation_base%io_type_w==2) then
         call self%field%write_field()
         if (self%equation_base%enable_stat_time>0) call self%equation_base%write_stats()
+        if (self%equation_base%enable_stat_time>0 .and. self%equation_base%enable_wmles>0) call self%equation_base%write_stats_wm()
         if (self%equation_base%enable_stat_3d>0) call self%equation_base%write_stats_3d()
         if (self%equation_base%enable_tspec>0) then
           self%equation_base%w_tspec = self%w_tspec_gpu
@@ -2142,6 +2145,11 @@ contains
 
         if (self%grid%grid_dim == 1) then
           call self%equation_base%compute_stats()
+          if (self%equation_base%enable_wmles>0) then
+            self%equation_base%wmles_out(1,:,:) = self%tauw_wm_gpu
+            self%equation_base%wmles_out(2,:,:) = self%qwall_wm_gpu
+            call self%equation_base%compute_stats_wm()
+          endif
         elseif(self%grid%grid_dim == 2) then
           call self%equation_base%compute_stats_c2()
           if(self%equation_base%flow_init == 5) then
@@ -2381,6 +2389,7 @@ contains
         if (self%equation_base%io_type_w==2) then
           call self%field%write_field()
           if (self%equation_base%enable_stat_time>0) call self%equation_base%write_stats()
+          if (self%equation_base%enable_stat_time>0 .and. self%equation_base%enable_wmles>0) call self%equation_base%write_stats_wm()
           if (self%equation_base%enable_stat_3d>0) call self%equation_base%write_stats_3d()
           if (self%equation_base%enable_tspec>0) then
             self%equation_base%w_tspec = self%w_tspec_gpu

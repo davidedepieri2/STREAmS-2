@@ -13,6 +13,7 @@ program main
 
     call read_input
     call read_stat
+    if (enable_wmles>0) call read_stat_wmles
 
     if (flow_init==0) call stats1d !channel flow statistics
 
