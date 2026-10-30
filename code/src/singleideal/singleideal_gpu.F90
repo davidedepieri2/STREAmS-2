@@ -81,6 +81,8 @@ module streams_equation_singleideal_gpu_object
     integer, dimension(:,:), allocatable, device :: ijk_probe_gpu
     real(rkind), allocatable, dimension(:,:,:), device :: wallprop_gpu
     real(rkind), allocatable, dimension(:,:), device :: tauw_wm_gpu, qwall_wm_gpu
+    real(rkind), allocatable, dimension(:), device :: wfdy_gpu    ! wm_coupling = 1: drag share / dy of cells 1..nforce
+    integer :: wm_nforce = 0
 
     integer, dimension(:), allocatable, device :: lmax_tag_gpu
     integer, dimension(:), allocatable, device :: vis_tag_gpu
@@ -102,6 +104,8 @@ module streams_equation_singleideal_gpu_object
     procedure, pass(self) :: compute_residual
     procedure, pass(self) :: compute_airfoil_forces_runtime
     procedure, pass(self) :: print_progress
+    procedure, pass(self) :: wmles_health
+    procedure, pass(self) :: wm_forcing_setup
     procedure, pass(self) :: run
     procedure, pass(self) :: rk_sync
     procedure, pass(self) :: rk_async
@@ -262,7 +266,8 @@ contains
         call visflx_y_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
         & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
         & self%base_gpu%y_gpu, self%w_aux_gpu, self%fl_gpu, &
-        & enable_wmles, self%tauw_wm_gpu, self%qwall_wm_gpu)
+        & enable_wmles, self%tauw_wm_gpu, self%qwall_wm_gpu, &
+        & self%equation_base%wm_coupling, self%base_gpu%x_gpu, self%equation_base%x_rough)
         call visflx_z_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
         & calorically_perfect, self%equation_base%enable_les, self%equation_base%les_pr,&
         & self%base_gpu%z_gpu, self%w_aux_gpu, self%fl_gpu)
@@ -411,14 +416,15 @@ contains
                 y_gpu => self%base_gpu%y_gpu, w_aux_gpu => self%w_aux_gpu, &
                 tauw_wm_gpu => self%tauw_wm_gpu, qwall_wm_gpu => self%qwall_wm_gpu, &
                 x_gpu => self%base_gpu%x_gpu, x_rough => self%equation_base%x_rough, &
-                k_rough => self%equation_base%k_rough, lf => self%equation_base%lf)
+                k_rough => self%equation_base%k_rough, lf => self%equation_base%lf, &
+                wm_signsafe => self%equation_base%wm_signsafe, wm_fallback => self%equation_base%wm_fallback)
 
       blockDim = dim3(16,16,1)
       gridDim = dim3(ceiling(real(nx)/blockDim%x),ceiling(real(nz)/blockDim%y),1)
       call eval_wmles_wall_cuf<<<gridDim, blockDim>>>(nx, nz, ng, jmatch, wmles_model, twall, &
            Prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
            cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
-           y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf)
+           y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf, wm_signsafe, wm_fallback)
 
       endassociate
   endsubroutine eval_wmles_wall
@@ -494,6 +500,10 @@ contains
 
         if (flow_init == 5 .and. a_tr>0._rkind) call self%tripping()
 
+        if (self%equation_base%enable_wmles>0 .and. self%equation_base%wm_coupling==1) then
+          call wm_forcing_cuf(nx, ny, nz, nv, self%wm_nforce, self%fl_gpu, self%tauw_wm_gpu, self%wfdy_gpu, &
+               self%base_gpu%x_gpu, ng, self%equation_base%x_rough)
+        endif
         call update_flux_cuf(nx, ny, nz, nv, self%fl_gpu, self%fln_gpu, gamdt)
         if (channel_case) call self%force_rhs()
         if (grid_dim == 2 .and. enable_sponge > 0) call self%sponge()
@@ -1400,6 +1410,9 @@ contains
       allocate(self%wallprop_gpu(1-ng:nx+ng, 1-ng:nz+ng, 2:4))
       allocate(self%tauw_wm_gpu(1:nx, 1:nz))
       allocate(self%qwall_wm_gpu(1:nx, 1:nz))
+      self%tauw_wm_gpu = 0._rkind
+      self%qwall_wm_gpu = 0._rkind
+      if (self%equation_base%enable_wmles>0 .and. self%equation_base%wm_coupling==1) call self%wm_forcing_setup()
       allocate(self%fhat_gpu(1-ng:nx+ng, 1-ng:ny+ng, 1-ng:nz+ng, nv))
 
       allocate(self%wrecyc_gpu(ng,ny,nz,nv))
@@ -1726,6 +1739,7 @@ contains
           if(mode_async == 1) call self%rk_async()
           if (mod(icyc-icyc0, self%equation_base%print_control)==0) then
             call self%compute_residual()
+            if (self%equation_base%enable_wmles>0) call self%wmles_health()
             if (ieee_is_nan(self%equation_base%residual_rhou)) then
               if (self%masterproc) write(*,*) 'boom!!!'
               call self%base_gpu%copy_gpu_cpu()
@@ -1803,6 +1817,100 @@ contains
 
     endassociate
   endsubroutine run
+
+  subroutine wm_forcing_setup(self)
+    ! wm_coupling = 1: shares of the rough-wall drag in the cells below k, from the rough model's own exponential
+    ! canopy profile U = U_k exp(a (y/k - 1)) (Yang et al. 2016; Cogo et al., eqs. 6.1, A1, A4): drag density ~ U^2,
+    ! integrated over each cell's overlap with [0, k]. a from the same sheltering iteration as odewmles_rough
+    ! (same constants, gap lx = 2k hard-coded there too: see reports/code_changes_20261029, W4).
+    class(equation_singleideal_gpu_object), intent(inout) :: self
+    real(rkind), parameter :: kappa = 0.41_rkind, a_min = 0.4_rkind, c_theta = 1._rkind, cd = 1._rkind
+    real(rkind) :: k, lf, lx, utau_Uh, tan_theta, hs, a, d_h, z0_h, ylo, yhi, wsum, dyc
+    real(rkind), allocatable, dimension(:) :: w, wfdy
+    integer :: ii, j, nf
+    associate(yn => self%grid%yn, yg => self%grid%yg, ny => self%ny, jmatch => self%equation_base%jmatch)
+      k  = self%equation_base%k_rough
+      lf = self%equation_base%lf
+      if (.not. self%grid%is_y_staggered) call fail_input_any("wm_coupling = 1 needs ystag = 1")
+      lx = 2._rkind*k
+      utau_Uh = 0.1_rkind
+      do ii = 1, 20
+        tan_theta = c_theta*utau_Uh
+        hs = max(k-tan_theta*lx, 0._rkind)
+        a = a_min/(1._rkind-hs/k)
+        d_h = 1._rkind/(1._rkind-exp(-2._rkind*a))-1._rkind/(2._rkind*a)
+        z0_h = (1._rkind-d_h)*exp(-kappa/sqrt(1._rkind/(2._rkind*a)*cd*lf*(1._rkind-exp(-2._rkind*a))))
+        utau_Uh = kappa/log((k-d_h*k)/(z0_h*k))
+      enddo
+      nf = 0
+      do j = 1, ny
+        if (yn(j) < k) nf = j
+      enddo
+      if (nf < 1) call fail_input_any("wm_coupling = 1: no cell below k_rough")
+      if (jmatch <= nf) call fail_input_any("wm_coupling = 1: the matching node jmatch must be above the forced cells")
+      allocate(w(nf), wfdy(nf))
+      do j = 1, nf
+        ylo = min(yn(j), k) ; yhi = min(yn(j+1), k)
+        w(j) = k/(2._rkind*a)*(exp(2._rkind*a*(yhi/k-1._rkind)) - exp(2._rkind*a*(ylo/k-1._rkind)))
+      enddo
+      wsum = sum(w)
+      w = w/wsum
+      do j = 1, nf
+        dyc = yn(j+1)-yn(j)
+        wfdy(j) = w(j)/dyc
+      enddo
+      self%wm_nforce = nf
+      allocate(self%wfdy_gpu(nf))
+      self%wfdy_gpu = wfdy
+      if (self%masterproc) then
+        write(*,*) 'WMLES wm_coupling = 1: distributed drag, a, d/k, z0/k = ', a, d_h, z0_h
+        write(*,*) 'WMLES forced cells, shares, sum(share) = ', nf, w, sum(w)
+        write(*,*) 'WMLES check sum(w_j/dy_j*dy_j) = ', sum(wfdy*(yn(2:nf+1)-yn(1:nf)))
+      endif
+    endassociate
+  endsubroutine wm_forcing_setup
+
+  subroutine wmles_health(self)
+    ! Diagnostics only: one line per print_control steps in wmles_health.out, per branch (smooth: x < x_rough,
+    ! rough: x >= x_rough; with wmles_model 1 everything is smooth): columns, matching velocities <= 0, NaN tau/q,
+    ! min u at jmatch, min u at node 1, min/mean/max tau_wm. Values of the last RK sub-step.
+    class(equation_singleideal_gpu_object), intent(inout) :: self
+    real(rkind) :: xs, s(5,2), mn(3,2), mx(2), xlo(2), xhi(2)
+    integer :: b
+    logical, save :: first = .true.
+    associate(nx => self%nx, nz => self%nz, ng => self%ng, jmatch => self%equation_base%jmatch, &
+              w_aux_gpu => self%w_aux_gpu, tauw_wm_gpu => self%tauw_wm_gpu, qwall_wm_gpu => self%qwall_wm_gpu, &
+              x_gpu => self%base_gpu%x_gpu)
+      xs = huge(1._rkind)
+      if (self%equation_base%wmles_model == 3) xs = self%equation_base%x_rough
+      xlo = [-huge(1._rkind), xs] ; xhi = [xs, huge(1._rkind)]
+      s = 0._rkind
+      do b=1,2
+        call wmles_health_cuf(nx, nz, ng, jmatch, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, xlo(b), xhi(b), &
+             s(1,b), s(2,b), s(3,b), mn(1,b), mn(2,b), mn(3,b), mx(b), s(4,b))
+      enddo
+      call mpi_allreduce(mpi_in_place,s,10,mpi_prec,mpi_sum,self%equation_base%field%mp_cart,self%mpi_err)
+      call mpi_allreduce(mpi_in_place,mn,6,mpi_prec,mpi_min,self%equation_base%field%mp_cart,self%mpi_err)
+      call mpi_allreduce(mpi_in_place,mx,2,mpi_prec,mpi_max,self%equation_base%field%mp_cart,self%mpi_err)
+      if (self%masterproc) then
+        open(unit=16,file='wmles_health.out',position='append')
+        if (first) then
+          write(16,'(a,i0,a,es14.6,a,i0,a,es14.6,a,es14.6)') '# jmatch ', jmatch, ' hw ', self%grid%yg(jmatch), &
+            ' wmles_model ', self%equation_base%wmles_model, ' x_rough ', self%equation_base%x_rough, &
+            ' k_rough ', self%equation_base%k_rough
+          write(16,'(a)') '# icyc time | per branch smooth, rough: ncol n(u_p<=0) n(NaN) min(u_p) min(u_1) '// &
+            'min(tau) mean(tau) max(tau)'
+          first = .false.
+        endif
+        do b=1,2
+          s(5,b) = s(4,b)/max(s(1,b)-s(3,b),1._rkind)
+        enddo
+        write(16,'(i10,es16.8,2(3f12.0,5es14.5))') self%equation_base%icyc, self%equation_base%time, &
+          (s(1,b), s(2,b), s(3,b), mn(1,b), mn(2,b), mn(3,b), s(5,b), mx(b), b=1,2)
+        close(16)
+      endif
+    endassociate
+  endsubroutine wmles_health
 
   subroutine print_progress(self)
     class(equation_singleideal_gpu_object), intent(inout) :: self

@@ -5020,7 +5020,8 @@ contains
 
   subroutine visflx_y_cuf(nx, ny, nz, nv, ng, prandtl, t0, indx_cp_l, indx_cp_r, cp_coeff_gpu,&
   & calorically_perfect, enable_les, les_pr, y_gpu, w_aux_gpu, fl_gpu, &
-  & enable_wmles, tauw_wm_gpu, qwall_wm_gpu)
+  & enable_wmles, tauw_wm_gpu, qwall_wm_gpu, &
+  & wm_coupling, x_gpu, x_rough)
 
     integer, intent(in) :: nx, ny, nz, nv, ng, calorically_perfect, enable_les
     integer, intent(in) :: indx_cp_l, indx_cp_r
@@ -5031,6 +5032,9 @@ contains
     real(rkind), dimension(1-ng:), intent(in), device :: y_gpu
     real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in), device :: cp_coeff_gpu
     real(rkind), dimension(1:,1:), intent(in), device :: tauw_wm_gpu, qwall_wm_gpu
+    integer, intent(in) :: wm_coupling
+    real(rkind), intent(in) :: x_rough
+    real(rkind), dimension(1-ng:), intent(in), device :: x_gpu
     integer :: i,j,k,iv,ll,iercuda
     real(rkind) :: uu,vv,ww,tt,mu,qq
     real(rkind) :: uup,vvp,wwp,ttp,mup,qqp
@@ -5084,7 +5088,12 @@ contains
             ! (which assumes a resolved viscous sublayer) with the modeled tau_wall/q_wall,
             ! precomputed by eval_wmles_wall_cuf (matched to the resolved state at jmatch).
             sigx = tauw_wm_gpu(i,k)
-            sigq = qwall_wm_gpu(i,k) 
+            sigq = qwall_wm_gpu(i,k)
+            ! wm_coupling = 1: on rough columns the drag is applied as a body force in the cells below k
+            ! (wm_forcing_cuf), so no x-momentum crosses the wall face; the heat flux stays here
+            if (wm_coupling == 1) then
+              if (x_gpu(i) >= x_rough) sigx = 0._rkind
+            endif
           endif
           if (j>0) then
             fl_gpu(i,j,k,2) = fl_gpu(i,j,k,2) + fl2o-sigx*dyhl
@@ -8644,6 +8653,17 @@ contains
 
     attributes(device) subroutine odewmles_rough(Prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
                       calorically_perfect,sutherland_S,u_inf,hw,u_p,T_w,T_h,p_h,tau_wall,q_wall,k,lf)
+        ! Ported from the reference Python implementation
+        ! /home/davide/documenti/scripts_github/wm_rough/vers_5/rough_wm_new.py (wm_GFM_adim),
+        ! replacing the previous version of this subroutine wholesale. Two physical changes
+        ! vs. the previous version: (1) the profile is now explicitly resolved from y=0 (the
+        ! true wall) up to y=k (the roughness crest) with an exponential attenuation profile
+        ! u=Uh*exp(a*(y-k)/k), instead of jumping straight from y=k with u=Uh -- this is meant
+        ! to address the "injection-point mismatch" caveat (log law only valid above the crest,
+        ! flux substitution acting at the wall face) documented elsewhere in this project; (2)
+        ! the Crocco-Busemann-type T(u) relation now uses the matching-point state (T_h,u_p)
+        ! and a fixed recovery factor rf=0.8, instead of the free-stream state (Te,Ue) used
+        ! previously -- Te/Ue/Prandtl-based recovery factor are no longer used by this model.
         implicit none
 
         real(rkind)                 , value :: Prandtl, mu0, t0, u_inf,rgas0
@@ -8658,193 +8678,154 @@ contains
         integer, parameter :: nw = 3000
 
         ! local declarations
-        integer, parameter :: max_iter_sec = 15
-        real(rkind), parameter :: toll = 1.0E-08_rkind
-        integer , parameter :: itmx = 10
-        real(rkind)            :: c_p
-        real(rkind)            :: rerr
-        real(rkind) :: rhow,muw,rho_m1,mu_m1,y_sl_m1,mu_t
-        real(rkind) :: utau,l_visc,dy,y_half,f,y_sl_half,detA,a_,b_
-        real(rkind) :: dysl,drho_dy,dmu_dy,dU_incomp_dysl,dUp_dysl,dT_du_w
-        real(rkind) :: rho,mu,mue,mu_half,y_sl,T_next,utau_prev,r,Ue,Te,Me
-        real(rkind) :: rho_half,rhoe,T_prev,utau_next,U_end_prev,Tr,dfu,dfT,klW
-        real(rkind), parameter :: kappa = 0.41, A_plus = 17
-        real(rkind), parameter :: gamma0=1.4_rkind
-        real(rkind), parameter :: tol_u = 1.0e-4,tol_T = 1.0e-4, step_ctl_fax =0.1
-        !real(rkind), parameter :: k = 0.12
-        real(rkind)                  :: tauW, qauW
-        integer, parameter :: max_iter = 30,relax_u = 1,relax_T =1
-        integer :: iter,i_y,iter_sec,ii,j
-        ! local declarations
-        real(rkind), dimension(0:nw) :: yf,u_sol,T_sol
-        real(rkind), dimension(1:nw) :: yc
-        real(rkind), dimension(1:nw) :: dy_vec
-        real(rkind)                  :: dy_wall
-        real(rkind)                  :: rsOld, rs,T_k,T_r
-        real(rkind)                  :: s_Pr,utau_est,tauw_est,a
-        real(rkind) :: lx,a_min,c_theta,cd,Pi,utau_Uh,tan_theta,hs,d_h,z0_h,d
-        real(rkind) :: Uh,du_dy,Ttau,rg
+        real(rkind) :: c_p
+        real(rkind) :: rhow, muw, rho, rho_m1, rho_half
+        real(rkind) :: utau, l_visc, dy, y_half, a
+        real(rkind) :: lx, a_min, c_theta, cd, kappa, utau_Uh, tan_theta, hs, d_h, z0_h, d
+        real(rkind) :: Uh, T_prev, T_next, y_m1
+        real(rkind) :: rf, T_r, b_1, b_2
+        real(rkind) :: utau_prev, utau_next, U_end_prev
+        real(rkind), parameter :: gamma0 = 1.4_rkind
+        real(rkind), parameter :: tol_u = 1.0e-8_rkind, tol_T = 1.0e-8_rkind
+        real(rkind), parameter :: relax_u = 1._rkind, relax_T = 1._rkind
+        integer, parameter :: max_iter = 300, max_iter_sec = 300
+        integer :: iter, iter_sec, ii, i_y, j
+        real(rkind), dimension(0:nw) :: yf, u_sol, T_sol
 
-        s_Pr=1.14*Prandtl
         c_p = gamma0/(gamma0-1._rkind)
 
-        !Geometry pre-step
-        lx = 2*k
-        !lf = 1._rkind/9._rkind !solidità frontale
-        a_min = 0.4 !coefficiente di attenuazione del paper, valido nei casi 'just sheltered'
-        c_theta = 1 !c'è una formula approssimativa per calcolarlo in funzione di h/w, nel nostro caso vale 1
-        cd = 1 !il paper lo prende come 1
-        Pi = 0.2 !coefficiente del wake per il profilo di velocità
+        !Geometry pre-step (unchanged from before)
+        lx = 2._rkind*k
+        a_min = 0.4_rkind !coefficiente di attenuazione del paper, valido nei casi 'just sheltered'
+        c_theta = 1._rkind !c'è una formula approssimativa per calcolarlo in funzione di h/w, nel nostro caso vale 1
+        cd = 1._rkind !il paper lo prende come 1
+        kappa = 0.41_rkind
 
-        !TROVO IL VALORE CORRETTO DI utau/Uh DALLE EQUAZIONI (3.4)(3.7)(3.8). LA (3.5) NON SI PUO' USARE!!!!!
-        utau_Uh=0.1 !valore iniziale su cui iterare
-        do ii =1,20 !10 step per trovare il rapporto u_tau/U_h corretto
-            tan_theta = c_theta*utau_Uh !equazione 3.16
-            hs = max(k-tan_theta*lx,0._rkind) !3.17
-            a = a_min/(1-hs/k) !3.15
-            d_h = 1/(1-exp(-2*a))-1/(2*a) !equazione 3.7
-            z0_h = (1-d_h)*exp(-kappa/sqrt(1/(2*a)*cd*lf*(1-exp(-2*a)))) !3.8 in teoria posso usarla
-            d = d_h*k !3.7
-            utau_Uh = kappa/log((k-d)/(z0_h*k)) !3.4
+        utau_Uh = 0.1_rkind !valore iniziale su cui iterare
+        do ii = 1,20
+            tan_theta = c_theta*utau_Uh
+            hs = max(k-tan_theta*lx,0._rkind)
+            a = a_min/(1._rkind-hs/k)
+            d_h = 1._rkind/(1._rkind-exp(-2._rkind*a))-1._rkind/(2._rkind*a)
+            z0_h = (1._rkind-d_h)*exp(-kappa/sqrt(1._rkind/(2._rkind*a)*cd*lf*(1._rkind-exp(-2._rkind*a))))
+            d = d_h*k
+            utau_Uh = kappa/log((k-d)/(z0_h*k))
         enddo
 
-        if((hw-k)<0._rkind) print*, 'error grid'
+        if ((hw-k) < 0._rkind) print*, 'error grid'
 
-        Te = t0
-        Ue = u_inf
-        Me = Ue/sqrt(gamma0*Te)
         rhow = p_h/T_w
-        utau_est = utau_Uh*u_p
-        tauw_est = utau**2*rhow
-        rhoe = p_h/Te
         muw  = mu0 * (T_w/t0)**1.5_rkind * &
                (1._rkind+sutherland_S/T_ref_dim)/(T_w/t0 + sutherland_S/T_ref_dim)
-        klW  = c_p*muw/Prandtl
-        mue  = mu0
-        r    = Prandtl**(1./3.)
-        Tr = Te*(1+r*(gamma0-1)/2*Me**2)
-        tauW = muw*u_p/hw
-        utau = sqrt(abs(tauW)/rhow)
+
+        ! initial guess
+        tau_wall = muw*u_p/hw
+        utau = sqrt(abs(tau_wall)/rhow)
         utau_prev = utau
-        qauW = c_p*muw/Prandtl*(Tr-T_w)/hw+1e-4
-        qauW = c_p*muw/Prandtl*T_h/hw
-        Ttau = -qauW/(c_p*rhow*utau)
-        rg = Prandtl**(1._rkind/3._rkind)
+        U_end_prev = 0._rkind
 
-        detA = u_p * (Ue**2) - (u_p**2) * Ue
+        ! Crocco-Busemann-type T(u), at the matching point, fixed recovery factor
+        rf = 0.8_rkind
+        T_r = T_h + rf*u_p**2/(2._rkind*c_p)
+        b_1 = (T_r - T_w)/u_p
+        b_2 = -rf/(2._rkind*c_p)
 
-        if (abs(detA) < 1.0e-12) print *, "Error: determinant is zero"
-
-        !a_ = ((T_h - T_w) * (Ue**2) - (Te - T_w) * (u_p**2)) / detA
-        !b_ = (u_p * (Te - T_w) - Ue * (T_h - T_w)) / detA
-
-        T_r = Te + r * Ue**2 / (2*c_p)
-        a_ = (T_r - T_w) / Ue
-        b_ = (Te - T_r) / Ue**2
-
-        iter_sec = 1
-
-        u_sol = 0._rkind
-        T_sol = 0._rkind
         do iter = 1,max_iter
-         rho_m1 = rhow
-         mu_m1 = muw
-         utau_Uh = kappa/log((k-d)/(z0_h*k))
          Uh = utau/utau_Uh
+         i_y = 20
+         do j = 0,i_y
+           yf(j) = real(j,rkind)/real(i_y,rkind)*k
+           u_sol(j) = Uh*exp(a*(yf(j)-k)/k)
+           T_sol(j) = T_w + b_1*u_sol(j) + b_2*u_sol(j)**2
+         enddo
          l_visc = muw/rhow/utau
-         dy = l_visc*0.6
-         u_sol(0) = Uh
-         T_sol(0) = T_w+a_*Uh+b_*Uh**2
-         T_k = T_sol(0)
-         yf(0) = k
-         j=0
-         do while(yf(j)<hw)
-          dy = max(dy,(hw-k)/200._rkind)
-          dy = min(dy,hw-yf(j),dy)
-          y_half    = yf(j) + 0.5*dy
-          j = j + 1
-          yf(j) = yf(j-1) + dy
-          T_sol(j) = T_sol(j-1)
-          T_prev = T_sol(j)
-          do iter_sec=1,max_iter_sec
-           rho = T_w/T_sol(j)*rhow
-           mu  = mu0 * (T_sol(j)/t0)**1.5_rkind * &
-                 (1._rkind+sutherland_S/T_ref_dim)/(T_sol(j)/t0 + sutherland_S/T_ref_dim)
+         dy = l_visc*0.2_rkind
+         y_m1 = yf(i_y)
+         rho_m1 = T_w/T_sol(i_y)*rhow
+
+         do while (yf(i_y) < hw)
+          ! Floor the step so the outer region (k to hw) always takes at most ~200
+          ! steps regardless of how small l_visc*0.2 is (the fixed-step integration
+          ! above had no such floor and could silently run past nw at high Re_tau;
+          ! now safely bounded well within nw=3000, same floor convention as the
+          ! previous version of this subroutine).
+          dy = max(dy, (hw-k)/200._rkind)
+          dy = min(dy, hw-yf(i_y))
+          if (i_y >= nw) then
+            print*, 'error: odewmles_rough ran out of y-nodes (nw) before reaching hw'
+            exit
+          endif
+          i_y = i_y + 1
+          yf(i_y) = yf(i_y-1) + dy
+          T_sol(i_y) = T_sol(i_y-1)
+          T_prev = T_sol(i_y)
+          do iter_sec = 1,max_iter_sec
+           rho = T_w/T_sol(i_y)*rhow
            rho_half = 0.5_rkind*(rho+rho_m1)
-           mu_half = 0.5_rkind*(mu+mu_m1)
+           y_half = 0.5_rkind*(yf(i_y)+y_m1)
 
-           du_dy = utau/(kappa*(y_half-d))
+           u_sol(i_y) = u_sol(i_y-1) + (yf(i_y)-y_m1)*utau/(kappa*(y_half-d))/sqrt(rho_half/rhow)
+           T_next = T_w + b_1*u_sol(i_y) + b_2*u_sol(i_y)**2
+           T_sol(i_y) = max(T_next,0._rkind)
 
-           u_sol(j) = u_sol(j-1) + dy*du_dy/sqrt(rho_half/rhow)
-           !T_next = T_w +Prandtl*u_sol(j)/utau*Ttau-rg*u_sol(j)**2/(2*c_p)
-           !tauW = rhow*utau**2
-           T_next = T_w + a_*u_sol(j) + b_*u_sol(j)**2
-           T_sol(j) = T_prev + relax_T*(T_next-T_prev)
-           T_sol(j) = max(T_sol(j),0._rkind)
-
-           if ((T_sol(j)-T_prev)**2/T_sol(j)**2 < tol_T) exit
-           T_prev = T_sol(j)
+           if ((T_sol(i_y)-T_prev)**2/T_sol(i_y)**2 < tol_T) exit
+           T_prev = T_sol(i_y)
           enddo
-
-
-         !if (iter_sec == max_iter_sec) print*, 'err'
-         rho_m1 = rho
-         mu_m1 = mu
+          y_m1 = yf(i_y)
+          rho_m1 = rho
          enddo
 
-         if (abs(yf(j)-hw)/hw > 1.0e-8) print*, 'error 1'
+         if (abs(yf(i_y)-hw)/hw > 1.0e-8) print*, 'error 1'
 
          if (iter.eq.1) then
            utau_next = utau*1.1_rkind
          else
-           utau_next = utau + relax_u*(u_p-u_sol(j))*(utau-utau_prev)/(u_sol(j)-U_end_prev)
+           utau_next = utau + relax_u*(u_p-u_sol(i_y))*(utau-utau_prev)/(u_sol(i_y)-U_end_prev)
          endif
 
-         U_end_prev = u_sol(j)
+         U_end_prev = u_sol(i_y)
          utau_prev = utau
 
-         if (abs(u_p-u_sol(j))/u_p < tol_u) then
+         if (abs(u_p-u_sol(i_y))/u_p < tol_u) then
           utau = utau_next
-          tauW = rhow*utau**2
+          tau_wall = rhow*utau**2
           exit
          endif
          utau = utau_next
-         tauW = rhow*utau**2
-         qauW = Ttau*c_p*rhow*utau
-         rg = (T_w-Te)/(Ue**2/(2*c_p))-2*Prandtl*qauW/(Ue*tauW)
-         Ttau = (T_k+rg*Uh**2/(2*c_p)-T_w)/Prandtl*utau_Uh
+         tau_wall = rhow*utau**2
 
         enddo
 
-
-        qauW = Ttau*c_p*rhow*utau
-
-        tau_wall = tauW
-        q_wall   = qauW
-
-
+        q_wall = c_p*tau_wall*b_1/0.8_rkind
 
     endsubroutine odewmles_rough
 
     attributes(global) subroutine eval_wmles_wall_cuf(nx, nz, ng, jmatch, wmles_model, twall, &
                       prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0, &
                       cp_coeff_gpu, indx_cp_l, indx_cp_r, calorically_perfect, &
-                      y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf)
+                      y_gpu, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, x_rough, k_rough, lf, &
+                      wm_signsafe, wm_fallback)
     ! Precomputes the wall-modeled tau_wall/q_wall for every (i,k) wall-parallel
     ! column, once per RK substep, ahead of visflx_y_cuf (which just reads the result
     ! at the wall face). Kept as a separate global kernel because NVFORTRAN does not
     ! support calling an intent(out)-argument device subroutine from within a
     ! !$cuf kernel do loop (visflx_y_cuf uses that construct).
     implicit none
+    ! wm_signsafe = 1: the models are called with |u_p| and tau takes the sign of u_p; below |u_p| = 1e-3 u0 the
+    ! viscous limit tau = mu_w u_p/hw, q = k_w (T_h - T_w)/hw (the smooth model returns NaN for u_p < 0, the rough
+    ! model returns tau > 0 for u_p < 0 and NaN for u_p = 0). wm_fallback = 1: a NaN tau or q is replaced by the
+    ! value of the previous sub-step. Both 0 (default) = the original behaviour.
     integer, value :: nx, nz, ng, jmatch, wmles_model, indx_cp_l, indx_cp_r, calorically_perfect
+    integer, value :: wm_signsafe, wm_fallback
     real(rkind), value :: twall, prandtl, mu0, t0, T_ref_dim, sutherland_S, rgas0, u0
     real(rkind), value :: x_rough, k_rough, lf
     real(rkind), dimension(indx_cp_l:indx_cp_r+1), intent(in) :: cp_coeff_gpu
     real(rkind), dimension(1-ng:), intent(in) :: y_gpu, x_gpu
     real(rkind), dimension(1-ng:,1-ng:,1-ng:,1:), intent(in) :: w_aux_gpu
-    real(rkind), dimension(1:,1:), intent(out) :: tauw_wm_gpu, qwall_wm_gpu
-    integer :: i, k
+    real(rkind), dimension(1:,1:), intent(inout) :: tauw_wm_gpu, qwall_wm_gpu
+    integer :: i, k, ll
     real(rkind) :: dist_wm, u_hwm, t_hwm, p_hwm, tau_wall_wm, q_wall_wm
+    real(rkind) :: u_call, muw, cpw
 
     i = blockDim%x * (blockIdx%x - 1) + threadIdx%x
     k = blockDim%y * (blockIdx%y - 1) + threadIdx%y
@@ -8855,31 +8836,132 @@ contains
     t_hwm = w_aux_gpu(i,jmatch,k,6)
     p_hwm = w_aux_gpu(i,jmatch,k,1)*t_hwm*rgas0
 
-    select case (wmles_model)
-    case(1)
-      call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
-           calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
-    case(3)
-      ! EWM upstream of x_rough, roughness model downstream -- same node-1 flux
-      ! substitution mechanism as case(1), just a different per-column tau_w/q_w source.
-      if (x_gpu(i) < x_rough) then
-        call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
-             calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
-      else
-        call odewmles_rough(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
-             calorically_perfect,sutherland_S,u0,dist_wm,u_hwm,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm,k_rough,lf)
-      endif
-    end select
+    u_call = u_hwm
+    if (wm_signsafe == 1) u_call = abs(u_hwm)
 
-    tauw_wm_gpu(i,k) = tau_wall_wm
-    qwall_wm_gpu(i,k) = q_wall_wm
+    if (wm_signsafe == 1 .and. abs(u_hwm) < 1.e-3_rkind*u0) then
+      muw = mu0 * (twall/t0)**1.5_rkind * &
+            (1._rkind + sutherland_S/T_ref_dim)/(twall/t0 + sutherland_S/T_ref_dim)
+      if (calorically_perfect==1) then
+        cpw = cp_coeff_gpu(0)
+      else
+        cpw = 0._rkind
+        do ll=indx_cp_l,indx_cp_r
+          cpw = cpw+cp_coeff_gpu(ll)*(twall/t0)**ll
+        enddo
+      endif
+      tau_wall_wm = muw*u_hwm/dist_wm
+      q_wall_wm = muw*cpw/prandtl*(t_hwm - twall)/dist_wm
+    else
+      select case (wmles_model)
+      case(1)
+        call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+             calorically_perfect,sutherland_S,u0,dist_wm,u_call,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
+      case(3)
+        ! EWM upstream of x_rough, roughness model downstream -- same node-1 flux
+        ! substitution mechanism as case(1), just a different per-column tau_w/q_w source.
+        if (x_gpu(i) < x_rough) then
+          call odewmles_ref(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+               calorically_perfect,sutherland_S,u0,dist_wm,u_call,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm)
+        else
+          call odewmles_rough(prandtl,mu0,t0,T_ref_dim,cp_coeff_gpu,indx_cp_l,indx_cp_r,rgas0, &
+               calorically_perfect,sutherland_S,u0,dist_wm,u_call,twall,t_hwm,p_hwm,tau_wall_wm,q_wall_wm,k_rough,lf)
+        endif
+      end select
+      if (wm_signsafe == 1) tau_wall_wm = sign(1._rkind, u_hwm)*tau_wall_wm
+    endif
 
     if ((tau_wall_wm /= tau_wall_wm) .or. (q_wall_wm /= q_wall_wm) .or. abs(tau_wall_wm) > 0.5_rkind) then
-      print *, 'WMLES_ANOMALY i=', i, ' k=', k, ' tau_wall=', tau_wall_wm, ' q_wall=', q_wall_wm, &
+      print *, 'WMLES_ANOMALY x=', x_gpu(i), ' i=', i, ' k=', k, ' tau_wall=', tau_wall_wm, ' q_wall=', q_wall_wm, &
                ' u_hwm=', u_hwm, ' t_hwm=', t_hwm, ' p_hwm=', p_hwm
     endif
 
+    if (wm_fallback == 1 .and. ((tau_wall_wm /= tau_wall_wm) .or. (q_wall_wm /= q_wall_wm))) then
+      tau_wall_wm = tauw_wm_gpu(i,k)
+      q_wall_wm = qwall_wm_gpu(i,k)
+    endif
+    tauw_wm_gpu(i,k) = tau_wall_wm
+    qwall_wm_gpu(i,k) = q_wall_wm
+
     endsubroutine eval_wmles_wall_cuf
+
+  subroutine wmles_health_cuf(nx, nz, ng, jmatch, w_aux_gpu, tauw_wm_gpu, qwall_wm_gpu, x_gpu, xlo, xhi, &
+                              ncol, nneg, nnan, umin, u1min, taumin, taumax, tausum)
+    ! Diagnostics only (no effect on the solution): over the wall columns with xlo <= x < xhi, the number of columns,
+    ! of matching velocities <= 0 and of NaN tau/q, min matching velocity, min node-1 velocity, min/max/sum of tau_wm.
+    integer, intent(in) :: nx, nz, ng, jmatch
+    real(rkind), intent(in) :: xlo, xhi
+    real(rkind), dimension(1-ng:,1-ng:,1-ng:,1:), intent(in), device :: w_aux_gpu
+    real(rkind), dimension(1:,1:), intent(in), device :: tauw_wm_gpu, qwall_wm_gpu
+    real(rkind), dimension(1-ng:), intent(in), device :: x_gpu
+    real(rkind), intent(out) :: ncol, nneg, nnan, umin, u1min, taumin, taumax, tausum
+    integer :: i, k, iercuda
+    real(rkind) :: tw, qw
+
+    ncol = 0._rkind ; nneg = 0._rkind ; nnan = 0._rkind ; tausum = 0._rkind
+    umin = huge(1._rkind) ; u1min = huge(1._rkind) ; taumin = huge(1._rkind) ; taumax = -huge(1._rkind)
+    !$cuf kernel do(2) <<<*,*>>> reduce(+:ncol, nneg, nnan, tausum)
+    do k=1,nz
+      do i=1,nx
+        if (x_gpu(i) >= xlo .and. x_gpu(i) < xhi) then
+          tw = tauw_wm_gpu(i,k) ; qw = qwall_wm_gpu(i,k)
+          ncol = ncol + 1._rkind
+          if (w_aux_gpu(i,jmatch,k,2) <= 0._rkind) nneg = nneg + 1._rkind
+          if ((tw /= tw) .or. (qw /= qw)) then
+            nnan = nnan + 1._rkind
+          else
+            tausum = tausum + tw
+          endif
+        endif
+      enddo
+    enddo
+    !@cuf iercuda=cudadevicesynchronize()
+    !$cuf kernel do(2) <<<*,*>>> reduce(min:umin, u1min, taumin)
+    do k=1,nz
+      do i=1,nx
+        if (x_gpu(i) >= xlo .and. x_gpu(i) < xhi) then
+          umin = min(umin, w_aux_gpu(i,jmatch,k,2))
+          u1min = min(u1min, w_aux_gpu(i,1,k,2))
+          taumin = min(taumin, tauw_wm_gpu(i,k))
+        endif
+      enddo
+    enddo
+    !@cuf iercuda=cudadevicesynchronize()
+    !$cuf kernel do(2) <<<*,*>>> reduce(max:taumax)
+    do k=1,nz
+      do i=1,nx
+        if (x_gpu(i) >= xlo .and. x_gpu(i) < xhi) then
+          taumax = max(taumax, tauw_wm_gpu(i,k))
+        endif
+      enddo
+    enddo
+    !@cuf iercuda=cudadevicesynchronize()
+  endsubroutine wmles_health_cuf
+
+  subroutine wm_forcing_cuf(nx, ny, nz, nv, nforce, fl_gpu, tauw_wm_gpu, wfdy_gpu, x_gpu, ng, x_rough)
+    ! wm_coupling = 1: rough-wall drag as a body force in cells 1..nforce of rough columns (x >= x_rough).
+    ! wfdy_gpu(j) = w_j/dy_j, with w_j the share of the drag in cell j (sum w_j = 1), so the momentum removed per unit
+    ! wall area is exactly tau_wm. fl_gpu holds -RHS, as the wall-face stress does in visflx_y_cuf (fl(1) += tau/dy),
+    ! so the force is added. No energy term: the drag of a stationary wall does no work (kinetic -> internal energy).
+    integer, intent(in) :: nx, ny, nz, nv, nforce, ng
+    real(rkind), intent(in) :: x_rough
+    real(rkind), dimension(1:nx,1:ny,1:nz,1:nv), intent(inout), device :: fl_gpu
+    real(rkind), dimension(1:,1:), intent(in), device :: tauw_wm_gpu
+    real(rkind), dimension(1:), intent(in), device :: wfdy_gpu
+    real(rkind), dimension(1-ng:), intent(in), device :: x_gpu
+    integer :: i, j, k, iercuda
+    !$cuf kernel do(2) <<<*,*>>>
+    do k=1,nz
+      do i=1,nx
+        if (x_gpu(i) >= x_rough) then
+          do j=1,nforce
+            fl_gpu(i,j,k,2) = fl_gpu(i,j,k,2) + tauw_wm_gpu(i,k)*wfdy_gpu(j)
+          enddo
+        endif
+      enddo
+    enddo
+    !@cuf iercuda=cudadevicesynchronize()
+  endsubroutine wm_forcing_cuf
 
 endmodule streams_kernels_gpu
 

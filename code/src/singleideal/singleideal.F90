@@ -73,6 +73,10 @@ module streams_equation_singleideal_object
     integer(ikind) :: enable_wmles = 0
     integer(ikind) :: wmles_model
     integer(ikind) :: jmatch
+    integer(ikind) :: wm_signsafe = 0, wm_fallback = 0
+!   wm_coupling: 0 = tau_wm on the wall face (default), 1 = on rough columns the rough-model drag distributed as a body
+!   force over the cells below k with the model's own weights (exponential canopy profile), wall-face x-stress = 0
+    integer(ikind) :: wm_coupling = 0
     real(rkind) :: x_rough, k_rough, lf
     integer(ikind) :: weno_scheme, weno_version, flux_splitting
     real(rkind) :: sensor_threshold
@@ -500,6 +504,15 @@ contains
     if (self%enable_wmles>0) then
      call self%cfg%get("wmlespar","wmles_model",self%wmles_model)
      call self%cfg%get("wmlespar","jmatch",self%jmatch)
+     if (self%masterproc) write(*,*) 'WMLES jmatch = ', self%jmatch
+     if (self%cfg%has_key("wmlespar","wm_signsafe")) call self%cfg%get("wmlespar","wm_signsafe",self%wm_signsafe)
+     if (self%cfg%has_key("wmlespar","wm_fallback")) call self%cfg%get("wmlespar","wm_fallback",self%wm_fallback)
+     if (self%masterproc) write(*,*) 'WMLES wm_signsafe, wm_fallback = ', self%wm_signsafe, self%wm_fallback
+     if (self%cfg%has_key("wmlespar","wm_coupling")) call self%cfg%get("wmlespar","wm_coupling",self%wm_coupling)
+     if (.not. any(self%wm_coupling == [0,1])) call fail_input_any("wm_coupling must be 0 or 1")
+     if (self%wm_coupling == 1 .and. self%wmles_model /= 3) call fail_input_any("wm_coupling = 1 needs wmles_model = 3")
+     if (self%wm_coupling == 1 .and. self%mode_async /= 0) call fail_input_any("wm_coupling = 1 needs mode_async = 0")
+     if (self%masterproc) write(*,*) 'WMLES wm_coupling = ', self%wm_coupling
      select case (self%wmles_model)
      case(1)
      case(3)
